@@ -1,0 +1,13 @@
+Django>=5.1,<5.2
+djangorestframework>=3.15,<3.16
+django-cors-headers>=4.4,<4.5
+numpy>=2.1
+opencv-python-headless>=4.10
+Pillow>=11.0
+torch>=2.4
+torchvision>=0.19
+librosa>=0.11
+soundfile>=0.13
+speechbrain>=1.0
+huggingface_hub>=0.24
+mediapipe>=0.10.14
