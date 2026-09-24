@@ -1,11 +1,7 @@
 import 'package:flutter/material.dart';
 
 class LoadingOverlay extends StatelessWidget {
-  const LoadingOverlay({
-    super.key,
-    required this.visible,
-    this.message,
-  });
+  const LoadingOverlay({super.key, required this.visible, this.message});
 
   final bool visible;
   final String? message;

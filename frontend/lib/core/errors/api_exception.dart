@@ -1,11 +1,7 @@
 import 'package:dio/dio.dart';
 
 class ApiException implements Exception {
-  ApiException({
-    required this.message,
-    this.code,
-    this.statusCode,
-  });
+  ApiException({required this.message, this.code, this.statusCode});
 
   final String message;
   final String? code;
@@ -15,12 +11,11 @@ class ApiException implements Exception {
     final data = error.response?.data;
     final message = data is Map<String, dynamic>
         ? data['message']?.toString() ??
-            data['detail']?.toString() ??
-            error.message ??
-            'Request failed.'
+              data['detail']?.toString() ??
+              error.message ??
+              'Request failed.'
         : error.message ?? 'Request failed.';
-    final code =
-        data is Map<String, dynamic> ? data['code']?.toString() : null;
+    final code = data is Map<String, dynamic> ? data['code']?.toString() : null;
 
     return ApiException(
       message: message,

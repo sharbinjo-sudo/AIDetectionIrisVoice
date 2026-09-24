@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import atexit
 from dataclasses import dataclass
 from functools import lru_cache
 import math
 from pathlib import Path
 import struct
+from threading import Lock
 import wave
 
 from django.conf import settings
@@ -34,6 +36,13 @@ def _cosine_similarity(left: list[float], right: list[float]) -> float:
     if left_norm == 0 or right_norm == 0:
         raise BiometricProcessingError("Encountered a zero-length biometric embedding.")
     return numerator / (left_norm * right_norm)
+
+
+def _normalize_vector(values: list[float]) -> list[float]:
+    norm = math.sqrt(sum(value * value for value in values))
+    if norm <= 1e-12:
+        raise BiometricProcessingError("Encountered a zero-length biometric embedding.")
+    return [value / norm for value in values]
 
 
 def _mean(values: list[float]) -> float:
@@ -85,6 +94,7 @@ class VoiceSample:
     rms_level: float
     peak_level: float
     embedding: list[float]
+    segment_count: int = 1
 
 
 @dataclass
@@ -92,6 +102,7 @@ class IrisSample:
     iris_detected: bool
     quality_score: float
     embedding: list[float]
+    detection_confidence: float = 0.0
 
 
 @dataclass
@@ -119,7 +130,7 @@ class VoiceBiometricEngine:
             import librosa
             import torch
             from speechbrain.inference.speaker import EncoderClassifier
-            from speechbrain.utils.fetching import LocalStrategy
+            from speechbrain.utils.fetching import FetchConfig, LocalStrategy
         except Exception as exc:
             self._load_error = exc
             return
@@ -133,7 +144,8 @@ class VoiceBiometricEngine:
         if (local_voice_dir / "hyperparams.yaml").exists():
             local_voice_dir.mkdir(parents=True, exist_ok=True)
             sources.append(("local_pretrained", str(local_voice_dir), str(local_voice_dir)))
-        sources.append(("pretrained", settings.VOICE_MODEL_SOURCE, str(cache_dir)))
+        if not settings.BIOMETRIC_OFFLINE_MODE:
+            sources.append(("pretrained", settings.VOICE_MODEL_SOURCE, str(cache_dir)))
 
         load_errors: list[str] = []
         for mode, source, savedir in sources:
@@ -143,6 +155,10 @@ class VoiceBiometricEngine:
                     savedir=savedir,
                     run_opts={"device": "cpu"},
                     local_strategy=LocalStrategy.COPY,
+                    fetch_config=FetchConfig(
+                        allow_network=not settings.BIOMETRIC_OFFLINE_MODE,
+                        allow_updates=False,
+                    ),
                 )
                 self._mode = mode
                 self._source = source
@@ -156,7 +172,7 @@ class VoiceBiometricEngine:
 
     @property
     def ready(self) -> bool:
-        return True
+        return self._mode in {"pretrained", "local_pretrained"}
 
     @property
     def mode(self) -> str:
@@ -165,15 +181,23 @@ class VoiceBiometricEngine:
     def health(self) -> dict:
         detail = None
         if self._mode not in {"pretrained", "local_pretrained"} and self._load_error is not None:
-            detail = f"Using heuristic voice fallback. Pretrained load detail: {self._load_error}"
+            detail = f"Using heuristic voice fallback. Local model load detail: {self._load_error}"
         return {
-            "ready": True,
+            "ready": self.ready,
             "name": self.name if self._mode in {"pretrained", "local_pretrained"} else "Heuristic Voice Analyzer",
             "mode": self._mode,
             "source": self._source,
             "cache_dir": str(settings.VOICE_MODEL_CACHE_DIR),
             "detail": detail,
         }
+
+    def _ensure_ready(self) -> None:
+        if self.ready or settings.DEVELOPMENT_THRESHOLDS:
+            return
+        raise ModelUnavailableError(
+            "The local voice model is unavailable. Provision the local "
+            "SpeechBrain files and restart the backend."
+        )
 
     def _extract_fallback_wav(self, audio_path: str) -> tuple[list[float], int]:
         try:
@@ -271,9 +295,14 @@ class VoiceBiometricEngine:
             rms_level=_round4(rms_energy) or 0.0,
             peak_level=_round4(peak_level) or 0.0,
             embedding=embedding,
+            segment_count=max(
+                1,
+                int(duration_seconds // max(settings.VOICE_MIN_SECONDS, 0.1)),
+            ),
         )
 
     def extract_features(self, audio_path: str) -> VoiceSample:
+        self._ensure_ready()
         if self._mode not in {"pretrained", "local_pretrained"}:
             return self._extract_fallback_features(audio_path)
 
@@ -290,6 +319,21 @@ class VoiceBiometricEngine:
             raise BiometricProcessingError("The uploaded voice recording was empty.")
 
         duration_seconds = float(len(signal_values)) / float(sample_rate or 1)
+        target_sample_rate = int(settings.VOICE_SAMPLE_RATE)
+        if sample_rate != target_sample_rate:
+            try:
+                import numpy as np
+
+                signal_values = self._librosa.resample(
+                    y=np.asarray(signal_values, dtype=np.float32),
+                    orig_sr=sample_rate,
+                    target_sr=target_sample_rate,
+                ).astype(float).tolist()
+                sample_rate = target_sample_rate
+            except Exception as exc:
+                raise BiometricProcessingError(
+                    "The voice recording sample rate could not be normalized."
+                ) from exc
         rms_energy = math.sqrt(_mean([sample * sample for sample in signal_values]))
         peak_level = max((abs(sample) for sample in signal_values), default=0.0)
 
@@ -316,11 +360,32 @@ class VoiceBiometricEngine:
             (duration_score * 0.45) + (energy_score * 0.20) + (activity_score * 0.35)
         ) or 0.0
 
-        tensor = self._torch.tensor(signal_values, dtype=self._torch.float32).unsqueeze(0)
+        segment_size = max(
+            int(sample_rate * settings.VOICE_MIN_SECONDS),
+            1,
+        )
+        segments = [
+            signal_values[start : start + segment_size]
+            for start in range(0, len(signal_values), segment_size)
+            if len(signal_values[start : start + segment_size]) >= segment_size
+        ]
+        if not segments:
+            segments = [signal_values]
         try:
             with self._torch.no_grad():
-                embedding_tensor = self._classifier.encode_batch(tensor)
-            embedding = embedding_tensor.squeeze().cpu().numpy().astype(float).tolist()
+                embeddings = []
+                for segment in segments:
+                    tensor = self._torch.tensor(
+                        segment,
+                        dtype=self._torch.float32,
+                    ).unsqueeze(0)
+                    encoded = self._classifier.encode_batch(tensor)
+                    vector = encoded.squeeze().cpu().numpy().astype(float)
+                    norm = math.sqrt(float((vector * vector).sum()))
+                    embeddings.append(vector / max(norm, 1e-12))
+            averaged = sum(embeddings) / float(len(embeddings))
+            averaged /= max(float((averaged * averaged).sum()) ** 0.5, 1e-12)
+            embedding = averaged.astype(float).tolist()
         except Exception as exc:
             raise BiometricProcessingError(
                 "The pretrained voice model could not generate an embedding for this sample."
@@ -333,7 +398,28 @@ class VoiceBiometricEngine:
             rms_level=_round4(rms_energy) or 0.0,
             peak_level=_round4(peak_level) or 0.0,
             embedding=embedding,
+            segment_count=len(segments),
         )
+
+    def aggregate_samples(self, samples: list[VoiceSample]) -> list[float]:
+        """Build one speaker template from multiple quality-checked captures."""
+        if not samples:
+            raise BiometricProcessingError(
+                "At least one usable voice sample is required to build a template."
+            )
+        dimensions = {len(sample.embedding) for sample in samples}
+        if len(dimensions) != 1 or not next(iter(dimensions), 0):
+            raise BiometricProcessingError(
+                "Voice samples produced incompatible speaker embeddings."
+            )
+        weights = [max(float(sample.quality_score), 0.05) for sample in samples]
+        total_weight = sum(weights)
+        combined = [
+            sum(sample.embedding[index] * weight for sample, weight in zip(samples, weights))
+            / total_weight
+            for index in range(len(samples[0].embedding))
+        ]
+        return _normalize_vector(combined)
 
     def compare(self, audio_path: str, reference_embedding: list[float]) -> dict:
         sample = self.extract_features(audio_path)
@@ -341,11 +427,16 @@ class VoiceBiometricEngine:
         normalized_score = _clamp((raw_score + 1.0) / 2.0)
         quality_ok = sample.quality_score >= settings.VOICE_QUALITY_THRESHOLD
         activity_ok = sample.speech_activity_score >= settings.VOICE_ACTIVITY_THRESHOLD
+        segments_ok = sample.segment_count >= settings.MIN_VOICE_SEGMENTS
         match_ok = normalized_score >= settings.VOICE_SIMILARITY_THRESHOLD
-        passed = quality_ok and activity_ok and match_ok
+        passed = quality_ok and activity_ok and segments_ok and match_ok
 
         if sample.duration_seconds < settings.VOICE_MIN_SECONDS:
             message = "The recording was too quiet or too short. Speak clearly and try again."
+        elif not segments_ok:
+            message = (
+                f"Record at least {settings.MIN_VOICE_SEGMENTS} clear voice segments."
+            )
         elif not activity_ok:
             message = "No clear spoken microphone activity was detected. Speak clearly into the mic and try again."
         elif not quality_ok:
@@ -363,6 +454,7 @@ class VoiceBiometricEngine:
                 "speech_activity_score": sample.speech_activity_score,
                 "rms_level": sample.rms_level,
                 "peak_level": sample.peak_level,
+                "segment_count": sample.segment_count,
                 "raw_score": _round4(raw_score),
                 "normalized_score": _round4(normalized_score),
                 "threshold": settings.VOICE_SIMILARITY_THRESHOLD,
@@ -376,6 +468,18 @@ class VoiceBiometricEngine:
 class IrisBiometricEngine:
     name = "Local Iris ONNX Segmenter"
 
+    # MediaPipe Face Mesh contour landmarks only. Iris landmarks (468-477)
+    # are intentionally excluded: MediaPipe localizes the eye ROIs, while the
+    # Worldcoin ONNX model remains the sole iris detector/segmenter.
+    _LEFT_EYE_CONTOUR = (
+        362, 382, 381, 380, 374, 373, 390, 249,
+        263, 466, 388, 387, 386, 385, 384, 398,
+    )
+    _RIGHT_EYE_CONTOUR = (
+        33, 7, 163, 144, 145, 153, 154, 155,
+        133, 173, 157, 158, 159, 160, 161, 246,
+    )
+
     def __init__(self):
         self._load_error = None
         self._cv2 = None
@@ -384,6 +488,8 @@ class IrisBiometricEngine:
         self._Image = None
         self._landmarker = None
         self._onnx_net = None
+        self._onnx_inference_lock = Lock()
+        self._landmarker_inference_lock = Lock()
         self._mode = "heuristic"
         self._source = "heuristic"
         self._model_path = Path(settings.IRIS_MODEL_PATH)
@@ -407,13 +513,12 @@ class IrisBiometricEngine:
                 self._mode = "local_onnx"
                 self._source = str(self._onnx_model_path)
                 self._load_error = None
-                return
         except Exception as exc:
             self._load_error = exc
 
         try:
             if self._cv2 is None or self._np is None:
-                raise RuntimeError("OpenCV and NumPy are required for MediaPipe iris loading.")
+                raise RuntimeError("OpenCV and NumPy are required for eye ROI localization.")
             import mediapipe as mp
             from mediapipe.tasks import python
             from mediapipe.tasks.python import vision
@@ -424,11 +529,19 @@ class IrisBiometricEngine:
         self._mp = mp
 
         try:
-            model_path = ensure_remote_asset(
-                destination=self._model_path,
-                description="iris model",
-                urls=[settings.IRIS_MODEL_URL],
-            )
+            if self._model_path.exists():
+                model_path = self._model_path
+            elif settings.BIOMETRIC_OFFLINE_MODE:
+                raise ModelUnavailableError(
+                    "The local MediaPipe face-landmarker asset is missing. "
+                    f"Expected it at {self._model_path}."
+                )
+            else:
+                model_path = ensure_remote_asset(
+                    destination=self._model_path,
+                    description="face-landmarker model",
+                    urls=[settings.IRIS_MODEL_URL],
+                )
             options = vision.FaceLandmarkerOptions(
                 base_options=python.BaseOptions(model_asset_path=str(model_path)),
                 running_mode=vision.RunningMode.IMAGE,
@@ -440,15 +553,23 @@ class IrisBiometricEngine:
                 output_facial_transformation_matrixes=False,
             )
             self._landmarker = vision.FaceLandmarker.create_from_options(options)
-            self._mode = "pretrained"
-            self._source = settings.IRIS_MODEL_URL
+            if self._onnx_net is None:
+                self._mode = "pretrained"
+                self._source = settings.IRIS_MODEL_URL
             self._load_error = None
         except Exception as exc:
             self._load_error = exc
 
     @property
     def ready(self) -> bool:
-        return self._Image is not None
+        return (
+            self._mode == "local_onnx"
+            and self._Image is not None
+            and self._cv2 is not None
+            and self._np is not None
+            and getattr(self, "_landmarker", None) is not None
+            and getattr(self, "_onnx_net", None) is not None
+        )
 
     @property
     def mode(self) -> str:
@@ -457,11 +578,11 @@ class IrisBiometricEngine:
     def health(self) -> dict:
         detail = None
         if self._mode == "heuristic" and self._load_error is not None:
-            detail = f"Using heuristic iris fallback. Pretrained load detail: {self._load_error}"
-        model_name = {
-            "local_onnx": "Local Iris ONNX Segmenter",
-            "pretrained": "MediaPipe Face Landmarker",
-        }.get(self._mode, "Heuristic Iris Analyzer")
+            detail = (
+                "Iris engine unavailable; no fallback detector is permitted. "
+                f"Model load detail: {self._load_error}"
+            )
+        model_name = "Local Iris ONNX Segmenter"
         return {
             "ready": self.ready,
             "name": model_name,
@@ -474,8 +595,22 @@ class IrisBiometricEngine:
     def _ensure_ready(self):
         if not self.ready:
             raise ModelUnavailableError(
-                "The iris verification engine is not ready. Install Pillow or the backend image dependencies and restart the server."
+                "The iris verification engine is not ready. The Worldcoin ONNX "
+                "segmenter, MediaPipe eye-ROI asset, OpenCV, NumPy, and Pillow "
+                "must all be available locally."
             )
+
+    def close(self) -> None:
+        """Release native MediaPipe resources before interpreter teardown."""
+        landmarker = getattr(self, "_landmarker", None)
+        self._landmarker = None
+        if landmarker is not None:
+            try:
+                landmarker.close()
+            except Exception:
+                # Native resources may already have been reclaimed while the
+                # process is shutting down.
+                pass
 
     def _read_image(self, image_path: str):
         self._ensure_ready()
@@ -564,10 +699,66 @@ class IrisBiometricEngine:
             image_format=self._mp.ImageFormat.SRGB,
             data=rgb_image,
         )
-        result = self._landmarker.detect(mp_image)
+        if self._landmarker is None:
+            return []
+        with self._landmarker_inference_lock:
+            result = self._landmarker.detect(mp_image)
         if not result.face_landmarks:
             return []
         return result.face_landmarks[0]
+
+    def _eye_rois_from_face_landmarks(self, image, landmarks: list[object]) -> list[dict]:
+        """Build padded eye crops using only non-iris face contour landmarks."""
+        assert self._np is not None
+        height, width = image.shape[:2]
+        rois: list[dict] = []
+        for eye_side, indices in (
+            ("LEFT", self._LEFT_EYE_CONTOUR),
+            ("RIGHT", self._RIGHT_EYE_CONTOUR),
+        ):
+            if not landmarks or max(indices) >= len(landmarks):
+                continue
+            points = self._np.array(
+                [
+                    [landmarks[index].x * width, landmarks[index].y * height]
+                    for index in indices
+                ],
+                dtype=self._np.float32,
+            )
+            min_x, min_y = points.min(axis=0)
+            max_x, max_y = points.max(axis=0)
+            eye_width = float(max_x - min_x)
+            eye_height = float(max_y - min_y)
+            if eye_width < 8.0 or eye_height < 3.0:
+                continue
+
+            center_x = float((min_x + max_x) * 0.5)
+            center_y = float((min_y + max_y) * 0.5)
+            # Preserve eyelid/sclera context while enlarging the iris
+            # substantially. Match the live ONNX tensor aspect ratio exactly,
+            # avoiding a preprocessing stretch that would skew the ellipse.
+            roi_width = max(eye_width * 1.75, eye_height * 4.2, 48.0)
+            roi_height = roi_width * (
+                float(settings.IRIS_TRACKING_INPUT_HEIGHT)
+                / float(settings.IRIS_TRACKING_INPUT_WIDTH)
+            )
+            x0 = max(int(round(center_x - roi_width * 0.5)), 0)
+            x1 = min(int(round(center_x + roi_width * 0.5)), width)
+            y0 = max(int(round(center_y - roi_height * 0.5)), 0)
+            y1 = min(int(round(center_y + roi_height * 0.5)), height)
+            if x1 - x0 < 24 or y1 - y0 < 18:
+                continue
+            rois.append(
+                {
+                    "eye_side": eye_side,
+                    "x": x0,
+                    "y": y0,
+                    "width": x1 - x0,
+                    "height": y1 - y0,
+                    "crop": image[y0:y1, x0:x1],
+                }
+            )
+        return rois
 
     def _group_iris_landmarks(self, landmarks: list[object]) -> list[list[object]]:
         if len(landmarks) < 478:
@@ -651,6 +842,64 @@ class IrisBiometricEngine:
         )
         return embedding.astype(float).tolist()
 
+    def _build_segmented_iris_embedding(self, crop, geometry: dict, roi: dict) -> list[float]:
+        """Normalize the ONNX-confirmed iris region into a comparable pattern.
+
+        The segmentation network remains the only iris detector.  This is a
+        deterministic texture descriptor (not another AI model): rotate the
+        fitted ellipse, crop it, normalize illumination, and z-score pixels.
+        """
+        assert self._cv2 is not None
+        assert self._np is not None
+        center = (
+            float(geometry["center_x"]) - float(roi["x"]),
+            float(geometry["center_y"]) - float(roi["y"]),
+        )
+        matrix = self._cv2.getRotationMatrix2D(
+            center, float(geometry["angle_degrees"]), 1.0
+        )
+        aligned = self._cv2.warpAffine(
+            crop,
+            matrix,
+            (crop.shape[1], crop.shape[0]),
+            flags=self._cv2.INTER_LINEAR,
+            borderMode=self._cv2.BORDER_REFLECT_101,
+        )
+        gray = self._cv2.cvtColor(aligned, self._cv2.COLOR_BGR2GRAY)
+        iris_radius = max(
+            min(float(geometry["iris_width"]), float(geometry["iris_height"]))
+            * 0.5,
+            4.0,
+        )
+        # Daugman-style rubber-sheet normalization: unwrap the annulus into a
+        # fixed polar texture. The pupil boundary is conservatively estimated
+        # as 25% of the fitted iris radius; the segmentation stage already
+        # required a coherent, centered pupil before this function is called.
+        polar = self._cv2.warpPolar(
+            gray,
+            (64, 256),
+            center,
+            iris_radius,
+            self._cv2.WARP_POLAR_LINEAR + self._cv2.WARP_FILL_OUTLIERS,
+        )
+        inner = max(int(round(64 * 0.25)), 1)
+        outer = max(int(round(64 * 0.95)), inner + 1)
+        annulus = polar[:, inner:outer]
+        normalized = self._cv2.resize(
+            annulus,
+            (32, 128),
+            interpolation=self._cv2.INTER_AREA,
+        ).T
+        normalized = self._cv2.equalizeHist(normalized).astype(self._np.float32)
+        normalized -= float(normalized.mean())
+        deviation = float(normalized.std())
+        if deviation < 1e-6:
+            raise BiometricProcessingError(
+                "The segmented iris did not contain enough texture detail."
+            )
+        normalized /= deviation
+        return _normalize_vector(normalized.flatten().astype(float).tolist())
+
     def _extract_onnx_candidate(self, image) -> IrisCandidate:
         assert self._cv2 is not None
         assert self._np is not None
@@ -667,8 +916,9 @@ class IrisBiometricEngine:
                 swapRB=False,
                 crop=False,
             )
-            self._onnx_net.setInput(blob)
-            output = self._onnx_net.forward()
+            with self._onnx_inference_lock:
+                self._onnx_net.setInput(blob)
+                output = self._onnx_net.forward()
             mask = self._np.squeeze(output)
 
             if mask.ndim == 3 and mask.shape[0] <= 8:
@@ -729,6 +979,284 @@ class IrisBiometricEngine:
                 self._cv2.cvtColor(image, self._cv2.COLOR_BGR2RGB)
             ).convert("L")
             return self._extract_fallback_candidate(pil_image)
+
+    def _run_onnx_for_eye_crops(self, crops: list[object]):
+        """Run the existing Worldcoin model once for a batch of eye ROIs."""
+        assert self._cv2 is not None
+        assert self._np is not None
+        blobs = []
+        for crop in crops:
+            gray = self._cv2.cvtColor(crop, self._cv2.COLOR_BGR2GRAY)
+            resized = self._cv2.resize(
+                gray,
+                (
+                    int(settings.IRIS_TRACKING_INPUT_WIDTH),
+                    int(settings.IRIS_TRACKING_INPUT_HEIGHT),
+                ),
+                interpolation=self._cv2.INTER_LINEAR,
+            )
+            normalized = resized.astype(self._np.float32) / 255.0
+            normalized = self._np.repeat(normalized[..., None], 3, axis=2)
+            normalized -= self._np.array(
+                [0.485, 0.456, 0.406], dtype=self._np.float32
+            )
+            normalized /= self._np.array(
+                [0.229, 0.224, 0.225], dtype=self._np.float32
+            )
+            blobs.append(self._np.transpose(normalized, (2, 0, 1)))
+
+        blob = self._np.stack(blobs).astype(self._np.float32)
+        with self._onnx_inference_lock:
+            self._onnx_net.setInput(blob)
+            output = self._onnx_net.forward()
+        if output.ndim != 4 or output.shape[0] != len(crops):
+            raise BiometricProcessingError(
+                "The iris segmentation model returned an unsupported batch shape."
+            )
+        if output.shape[1] == 4:
+            return output
+        if output.shape[-1] == 4:
+            return self._np.transpose(output, (0, 3, 1, 2))
+        raise BiometricProcessingError(
+            "The iris segmentation model did not return its four semantic masks."
+        )
+
+    def _geometry_from_eye_mask(
+        self,
+        probabilities,
+        roi: dict,
+        frame_width: int,
+        frame_height: int,
+    ) -> dict | None:
+        """Fit iris geometry in ROI pixels, then map it into frame pixels."""
+        assert self._cv2 is not None
+        assert self._np is not None
+        mask = self._np.clip(
+            self._np.nan_to_num(
+                probabilities[1].astype(self._np.float32),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ),
+            0.0,
+            1.0,
+        )
+        binary = mask >= 0.5
+        eyeball_binary = probabilities[0] >= 0.5
+        pupil_binary = probabilities[2] >= 0.5
+        if int(binary.sum()) < 25:
+            return None
+
+        component_count, labels, stats, _ = self._cv2.connectedComponentsWithStats(
+            binary.astype(self._np.uint8), connectivity=8
+        )
+        mask_height, mask_width = mask.shape[:2]
+        crop_width = int(roi["width"])
+        crop_height = int(roi["height"])
+        scale_x = crop_width / float(mask_width)
+        scale_y = crop_height / float(mask_height)
+        crop_area = float(crop_width * crop_height)
+        component_order = sorted(
+            range(1, component_count),
+            key=lambda index: int(stats[index, self._cv2.CC_STAT_AREA]),
+            reverse=True,
+        )
+
+        for component_index in component_order:
+            component_area = int(stats[component_index, self._cv2.CC_STAT_AREA])
+            area_ratio = component_area * scale_x * scale_y / max(crop_area, 1.0)
+            if component_area < 25 or area_ratio > 0.60:
+                continue
+            component_bool = labels == component_index
+            eyeball_coverage = float(eyeball_binary[component_bool].mean())
+            pupil_inside = pupil_binary & component_bool
+            pupil_area = int(pupil_inside.sum())
+            pupil_ratio = pupil_area / float(component_area)
+            if (
+                eyeball_coverage < 0.78
+                or pupil_area < max(8, int(component_area * 0.02))
+                or pupil_ratio > 0.58
+            ):
+                continue
+
+            pupil_count, pupil_labels, pupil_stats, _ = (
+                self._cv2.connectedComponentsWithStats(
+                    pupil_inside.astype(self._np.uint8), connectivity=8
+                )
+            )
+            if pupil_count <= 1:
+                continue
+            pupil_index = max(
+                range(1, pupil_count),
+                key=lambda index: int(pupil_stats[index, self._cv2.CC_STAT_AREA]),
+            )
+            coherent_pupil_ratio = float(
+                pupil_stats[pupil_index, self._cv2.CC_STAT_AREA]
+            ) / max(float(pupil_area), 1.0)
+            if coherent_pupil_ratio < 0.68:
+                continue
+
+            contours, _ = self._cv2.findContours(
+                component_bool.astype(self._np.uint8),
+                self._cv2.RETR_EXTERNAL,
+                self._cv2.CHAIN_APPROX_NONE,
+            )
+            if not contours:
+                continue
+            contour = max(contours, key=self._cv2.contourArea)
+            if len(contour) < 5:
+                continue
+            crop_contour = contour.astype(self._np.float32)
+            crop_contour[:, 0, 0] *= scale_x
+            crop_contour[:, 0, 1] *= scale_y
+            source_area = float(self._cv2.contourArea(crop_contour))
+            source_perimeter = float(self._cv2.arcLength(crop_contour, True))
+            if source_area <= 0.0 or source_perimeter <= 0.0:
+                continue
+
+            (center_x, center_y), (iris_width, iris_height), angle = (
+                self._cv2.fitEllipse(crop_contour)
+            )
+            iris_width = float(iris_width)
+            iris_height = float(iris_height)
+            if iris_width < 4.0 or iris_height < 4.0:
+                continue
+            axis_ratio = min(iris_width, iris_height) / max(iris_width, iris_height)
+            relative_diameter = min(iris_width, iris_height) / max(
+                float(min(crop_width, crop_height)), 1.0
+            )
+            if axis_ratio < 0.25 or relative_diameter < 0.10:
+                continue
+
+            pupil_y, pupil_x = self._np.where(pupil_labels == pupil_index)
+            pupil_center_x = float(pupil_x.mean()) * scale_x
+            pupil_center_y = float(pupil_y.mean()) * scale_y
+            pupil_center_offset = math.hypot(
+                pupil_center_x - float(center_x),
+                pupil_center_y - float(center_y),
+            ) / max(min(iris_width, iris_height) * 0.5, 1.0)
+            if pupil_center_offset > 0.68:
+                continue
+
+            ellipse_area = math.pi * iris_width * iris_height * 0.25
+            ellipse_coverage = _clamp(source_area / max(ellipse_area, 1.0))
+            circularity = _clamp(
+                (4.0 * math.pi * source_area)
+                / (source_perimeter * source_perimeter)
+            )
+            if circularity < 0.30:
+                continue
+            foreground_strength = float(mask[component_bool].mean())
+            confidence = _clamp(
+                (foreground_strength * 0.30)
+                + (eyeball_coverage * 0.18)
+                + (coherent_pupil_ratio * 0.14)
+                + (ellipse_coverage * 0.18)
+                + (circularity * 0.12)
+                + (axis_ratio * 0.08)
+            )
+            if confidence < 0.45:
+                continue
+
+            box_x, box_y, box_width, box_height = self._cv2.boundingRect(
+                crop_contour
+            )
+            frame_contour = crop_contour[:, 0, :].copy()
+            frame_contour[:, 0] += float(roi["x"])
+            frame_contour[:, 1] += float(roi["y"])
+            stride = max(1, len(frame_contour) // 64)
+            return {
+                "detected": True,
+                "eye_side": roi["eye_side"],
+                "confidence": _round4(confidence),
+                "stable": confidence >= settings.IRIS_TRACKING_STABLE_CONFIDENCE,
+                "center_x": _round4(float(center_x) + float(roi["x"])),
+                "center_y": _round4(float(center_y) + float(roi["y"])),
+                "iris_width": _round4(iris_width),
+                "iris_height": _round4(iris_height),
+                "radius": _round4((iris_width + iris_height) * 0.25),
+                "angle_degrees": _round4(float(angle)),
+                "circularity": _round4(circularity),
+                "contour": [
+                    [_round4(float(point[0])), _round4(float(point[1]))]
+                    for point in frame_contour[::stride]
+                ],
+                "bounding_box": {
+                    "x": _round4(float(box_x) + float(roi["x"])),
+                    "y": _round4(float(box_y) + float(roi["y"])),
+                    "width": _round4(float(box_width)),
+                    "height": _round4(float(box_height)),
+                },
+                "eye_roi": {
+                    key: roi[key] for key in ("x", "y", "width", "height")
+                },
+                "frame_width": frame_width,
+                "frame_height": frame_height,
+            }
+        return None
+
+    def track_iris(self, image_path: str) -> dict:
+        """Localize eye ROIs with face landmarks and segment them with ONNX."""
+        self._ensure_ready()
+        assert self._cv2 is not None
+        image = self._cv2.imread(image_path)
+        if image is None:
+            raise BiometricProcessingError(
+                "The camera frame could not be read for iris tracking."
+            )
+
+        frame_height, frame_width = image.shape[:2]
+        try:
+            landmarks = self._detect_landmarks(image)
+            rois = self._eye_rois_from_face_landmarks(image, landmarks)
+            debug_rois = [
+                {
+                    "eye_side": roi["eye_side"],
+                    **{key: roi[key] for key in ("x", "y", "width", "height")},
+                }
+                for roi in rois
+            ]
+            if not rois:
+                return {
+                    "detected": False,
+                    "confidence": 0.0,
+                    "eyes": [],
+                    "eye_rois": [],
+                    "frame_width": frame_width,
+                    "frame_height": frame_height,
+                }
+
+            outputs = self._run_onnx_for_eye_crops([roi["crop"] for roi in rois])
+            eyes = []
+            for probabilities, roi in zip(outputs, rois):
+                geometry = self._geometry_from_eye_mask(
+                    probabilities, roi, frame_width, frame_height
+                )
+                if geometry is not None:
+                    eyes.append(geometry)
+
+            response = {
+                "detected": bool(eyes),
+                "confidence": max(
+                    (float(eye["confidence"]) for eye in eyes), default=0.0
+                ),
+                "eyes": eyes,
+                "eye_rois": debug_rois,
+                "frame_width": frame_width,
+                "frame_height": frame_height,
+            }
+            if eyes:
+                primary = max(eyes, key=lambda eye: float(eye["confidence"]))
+                response.update(primary)
+                response["eyes"] = eyes
+                response["eye_rois"] = debug_rois
+            return response
+        except BiometricProcessingError:
+            raise
+        except Exception as exc:
+            raise BiometricProcessingError(
+                "The live eye ROI or iris segmentation stage failed."
+            ) from exc
 
     def _extract_pretrained_candidates(self, image) -> list[IrisCandidate]:
         groups = self._group_iris_landmarks(self._detect_landmarks(image))
@@ -792,6 +1320,7 @@ class IrisBiometricEngine:
                 iris_detected=candidate.quality_score >= 0.2,
                 quality_score=candidate.quality_score,
                 embedding=candidate.embedding,
+                detection_confidence=candidate.quality_score,
             )
 
         assert self._cv2 is not None
@@ -800,22 +1329,57 @@ class IrisBiometricEngine:
             raise BiometricProcessingError("The uploaded iris image could not be read.")
 
         if self._mode == "local_onnx":
-            candidate = self._extract_onnx_candidate(image)
+            # Enrollment and authentication use the same real eye-ROI path as
+            # live tracking. The Worldcoin mask must validate the iris before
+            # a pattern is stored or compared; never fall back to a full-frame
+            # or fixed-position estimate.
+            landmarks = self._detect_landmarks(image)
+            rois = self._eye_rois_from_face_landmarks(image, landmarks)
+            selected = next(
+                (roi for roi in rois if roi["eye_side"] == eye_side),
+                None,
+            )
+            if selected is None:
+                return IrisSample(False, 0.0, [], 0.0)
+            probabilities = self._run_onnx_for_eye_crops([selected["crop"]])[0]
+            height, width = image.shape[:2]
+            geometry = self._geometry_from_eye_mask(
+                probabilities, selected, width, height
+            )
+            if geometry is None:
+                return IrisSample(False, 0.0, [], 0.0)
+            radius = float(geometry["radius"])
+            candidate = IrisCandidate(
+                center_x=float(geometry["center_x"]) / float(width),
+                center_y=float(geometry["center_y"]) / float(height),
+                radius=radius,
+                quality_score=self._quality_score_pretrained(
+                    selected["crop"], radius, float(min(height, width))
+                ),
+                embedding=self._build_segmented_iris_embedding(
+                    selected["crop"], geometry, selected
+                ),
+                grayscale=[],
+            )
+            detection_confidence = float(geometry["confidence"])
         else:
             candidate = self._select_primary_candidate(
                 self._extract_pretrained_candidates(image),
                 eye_side,
             )
+            detection_confidence = candidate.quality_score if candidate else 0.0
         if candidate is None:
             return IrisSample(
                 iris_detected=False,
                 quality_score=0.0,
                 embedding=[],
+                detection_confidence=0.0,
             )
         return IrisSample(
             iris_detected=True,
             quality_score=candidate.quality_score,
             embedding=candidate.embedding,
+            detection_confidence=detection_confidence,
         )
 
     def compare(
@@ -831,6 +1395,7 @@ class IrisBiometricEngine:
                 "iris": {
                     "iris_detected": False,
                     "quality_score": sample.quality_score,
+                    "detection_confidence": sample.detection_confidence,
                     "raw_score": 0.0,
                     "normalized_score": 0.0,
                     "threshold": settings.IRIS_SIMILARITY_THRESHOLD,
@@ -857,6 +1422,7 @@ class IrisBiometricEngine:
             "iris": {
                 "iris_detected": sample.iris_detected,
                 "quality_score": sample.quality_score,
+                "detection_confidence": sample.detection_confidence,
                 "raw_score": _round4(raw_score),
                 "normalized_score": _round4(normalized_score),
                 "threshold": settings.IRIS_SIMILARITY_THRESHOLD,
@@ -864,6 +1430,109 @@ class IrisBiometricEngine:
                 "message": message,
             },
             "message": message,
+        }
+
+    def aggregate_samples(
+        self,
+        samples: list[IrisSample],
+        *,
+        minimum_samples: int | None = None,
+    ) -> list[float]:
+        required = max(1, minimum_samples or settings.MIN_IRIS_SAMPLES)
+        valid = [sample for sample in samples if sample.iris_detected and sample.embedding]
+        if len(valid) < required:
+            raise BiometricProcessingError(
+                f"At least {required} valid iris sample(s) are required."
+            )
+        dimension = len(valid[0].embedding)
+        if any(len(sample.embedding) != dimension for sample in valid):
+            raise BiometricProcessingError("Iris template dimensions were inconsistent.")
+        reference = valid[0].embedding
+        aligned = [reference]
+        # Polar templates are 32 radial rows x 128 angular columns. Compensate
+        # for small eye/camera rotations before averaging enrollment samples.
+        if dimension == 32 * 128:
+            assert self._np is not None
+            reference_matrix = self._np.asarray(reference).reshape(32, 128)
+            for sample in valid[1:]:
+                matrix = self._np.asarray(sample.embedding).reshape(32, 128)
+                best = max(
+                    range(-8, 9),
+                    key=lambda shift: _cosine_similarity(
+                        self._np.roll(matrix, shift, axis=1).flatten().tolist(),
+                        reference_matrix.flatten().tolist(),
+                    ),
+                )
+                aligned.append(
+                    self._np.roll(matrix, best, axis=1).flatten().astype(float).tolist()
+                )
+        else:
+            aligned.extend(sample.embedding for sample in valid[1:])
+        weights = [max(sample.quality_score, 0.05) for sample in valid]
+        total = sum(weights)
+        aggregate = [
+            sum(vector[index] * weight for vector, weight in zip(aligned, weights)) / total
+            for index in range(dimension)
+        ]
+        return _normalize_vector(aggregate)
+
+    def compare_samples(
+        self,
+        samples: list[IrisSample],
+        reference_embedding: list[float],
+        *,
+        minimum_samples: int | None = None,
+    ) -> dict:
+        required = max(1, minimum_samples or settings.MIN_IRIS_SAMPLES)
+        valid = [sample for sample in samples if sample.iris_detected and sample.embedding]
+        quality = _mean([sample.quality_score for sample in valid])
+        confidence = _mean([sample.detection_confidence for sample in valid])
+        if len(valid) < required:
+            return {
+                "iris": {
+                    "iris_detected": bool(valid),
+                    "quality_score": _round4(quality),
+                    "detection_confidence": _round4(confidence),
+                    "raw_score": 0.0,
+                    "normalized_score": 0.0,
+                    "threshold": settings.IRIS_SIMILARITY_THRESHOLD,
+                    "sample_count": len(valid),
+                    "valid_measurement": False,
+                    "passed": False,
+                    "message": f"At least {required} stable iris sample(s) are required.",
+                }
+            }
+        probe = self.aggregate_samples(valid, minimum_samples=required)
+        scores = [_cosine_similarity(probe, reference_embedding)]
+        if len(probe) == 32 * 128 and len(reference_embedding) == len(probe):
+            assert self._np is not None
+            matrix = self._np.asarray(probe).reshape(32, 128)
+            reference = self._np.asarray(reference_embedding).reshape(32, 128)
+            scores = [
+                _cosine_similarity(
+                    self._np.roll(matrix, shift, axis=1).flatten().tolist(),
+                    reference.flatten().tolist(),
+                )
+                for shift in range(-8, 9)
+            ]
+        raw_score = max(scores)
+        normalized_score = _clamp((raw_score + 1.0) / 2.0)
+        passed = normalized_score >= settings.IRIS_SIMILARITY_THRESHOLD
+        return {
+            "iris": {
+                "iris_detected": True,
+                "quality_score": _round4(quality),
+                "quality_threshold": settings.IRIS_QUALITY_THRESHOLD,
+                "detection_confidence": _round4(confidence),
+                "raw_score": _round4(raw_score),
+                "normalized_score": _round4(normalized_score),
+                "similarity_score": _round4(normalized_score),
+                "threshold": settings.IRIS_SIMILARITY_THRESHOLD,
+                "sample_count": len(valid),
+                "valid_measurement": True,
+                "passed": passed,
+                "message": "Iris matched the enrolled template." if passed else "Iris did not match the enrolled template.",
+            }
         }
 
     def evaluate_blink(
@@ -974,6 +1643,18 @@ def get_voice_engine() -> VoiceBiometricEngine:
 @lru_cache(maxsize=1)
 def get_iris_engine() -> IrisBiometricEngine:
     return IrisBiometricEngine()
+
+
+def _close_cached_engines() -> None:
+    if get_iris_engine.cache_info().currsize == 0:
+        return
+    try:
+        get_iris_engine().close()
+    except Exception:
+        pass
+
+
+atexit.register(_close_cached_engines)
 
 
 

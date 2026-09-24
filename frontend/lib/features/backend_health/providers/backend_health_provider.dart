@@ -12,11 +12,12 @@ final backendHealthRepositoryProvider = Provider<BackendHealthRepository>(
 
 class BackendHealthController extends AsyncNotifier<BackendHealthStatus> {
   Timer? _retryTimer;
+  Future<void>? _refreshInFlight;
 
   @override
   Future<BackendHealthStatus> build() async {
     _retryTimer?.cancel();
-    _retryTimer = Timer.periodic(const Duration(seconds: 6), (_) {
+    _retryTimer = Timer.periodic(const Duration(seconds: 3), (_) {
       refreshSilently();
     });
     ref.onDispose(() => _retryTimer?.cancel());
@@ -31,8 +32,23 @@ class BackendHealthController extends AsyncNotifier<BackendHealthStatus> {
   }
 
   Future<void> refreshSilently() async {
-    final result = await _fetchOrDisconnected();
-    state = AsyncData(result);
+    final inFlight = _refreshInFlight;
+    if (inFlight != null) {
+      await inFlight;
+      return;
+    }
+    final operation = () async {
+      final result = await _fetchOrDisconnected();
+      state = AsyncData(result);
+    }();
+    _refreshInFlight = operation;
+    try {
+      await operation;
+    } finally {
+      if (identical(_refreshInFlight, operation)) {
+        _refreshInFlight = null;
+      }
+    }
   }
 
   Future<BackendHealthStatus> _fetchOrDisconnected() async {

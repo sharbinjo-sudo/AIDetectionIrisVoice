@@ -6,11 +6,13 @@ class BiometricScoreCard extends StatelessWidget {
     required this.label,
     required this.value,
     this.detail,
+    this.valueLabel,
   });
 
   final String label;
   final double value;
   final String? detail;
+  final String? valueLabel;
 
   @override
   Widget build(BuildContext context) {
@@ -23,15 +25,12 @@ class BiometricScoreCard extends StatelessWidget {
             Text(label, style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 12),
             Text(
-              '${(value * 100).toStringAsFixed(1)}%',
-              style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                    fontWeight: FontWeight.w700,
-                  ),
+              valueLabel ?? '${(value * 100).toStringAsFixed(1)}%',
+              style: Theme.of(
+                context,
+              ).textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w700),
             ),
-            if (detail != null) ...[
-              const SizedBox(height: 8),
-              Text(detail!),
-            ],
+            if (detail != null) ...[const SizedBox(height: 8), Text(detail!)],
           ],
         ),
       ),

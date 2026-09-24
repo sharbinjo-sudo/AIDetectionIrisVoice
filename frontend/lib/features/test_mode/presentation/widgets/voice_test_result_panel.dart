@@ -3,10 +3,7 @@ import 'package:flutter/material.dart';
 import '../../models/voice_test_result.dart';
 
 class VoiceTestResultPanel extends StatelessWidget {
-  const VoiceTestResultPanel({
-    super.key,
-    required this.result,
-  });
+  const VoiceTestResultPanel({super.key, required this.result});
 
   final VoiceTestResult result;
 
@@ -28,12 +25,14 @@ class VoiceTestResultPanel extends StatelessWidget {
             Text('Threshold: ${_fmt(result.threshold)}'),
             Text('Passed: ${result.passed ? 'Yes' : 'No'}'),
             Text('Processing time: ${result.processingTimeMs} ms'),
-            if (result.message.isNotEmpty) Text('Backend message: ${result.message}'),
+            if (result.message.isNotEmpty)
+              Text('Backend message: ${result.message}'),
           ],
         ),
       ),
     );
   }
 
-  String _fmt(double? value) => value == null ? 'N/A' : value.toStringAsFixed(2);
+  String _fmt(double? value) =>
+      value == null ? 'N/A' : value.toStringAsFixed(2);
 }

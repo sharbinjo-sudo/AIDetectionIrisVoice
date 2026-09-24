@@ -7,9 +7,11 @@ class VerificationSession {
   const VerificationSession({
     required this.stage,
     required this.steps,
+    this.faceImagePaths = const [],
+    this.irisImagePaths = const [],
     this.irisImagePath,
-    this.blinkImagePath,
     this.voiceFilePath,
+    this.voiceFilePaths = const [],
     this.irisResult,
     this.voiceResult,
     this.finalResult,
@@ -19,9 +21,11 @@ class VerificationSession {
 
   final VerificationStage stage;
   final List<VerificationStep> steps;
+  final List<String> faceImagePaths;
+  final List<String> irisImagePaths;
   final String? irisImagePath;
-  final String? blinkImagePath;
   final String? voiceFilePath;
+  final List<String> voiceFilePaths;
   final IrisTestResult? irisResult;
   final VoiceTestResult? voiceResult;
   final VerificationResult? finalResult;
@@ -33,11 +37,11 @@ class VerificationSession {
       'Backend connection',
       'Camera permission',
       'Microphone permission',
-      'Open-eye challenge',
-      'Blink challenge',
+      'Face + iris samples',
+      'Iris quality validation',
       'Speak challenge',
       'Speech clarity',
-      'Human confidence',
+      'Identity confidence',
       'Final decision',
     ];
     return VerificationSession(
@@ -56,9 +60,11 @@ class VerificationSession {
   VerificationSession copyWith({
     VerificationStage? stage,
     List<VerificationStep>? steps,
+    List<String>? faceImagePaths,
+    List<String>? irisImagePaths,
     Object? irisImagePath = _sentinel,
-    Object? blinkImagePath = _sentinel,
     Object? voiceFilePath = _sentinel,
+    List<String>? voiceFilePaths,
     Object? irisResult = _sentinel,
     Object? voiceResult = _sentinel,
     Object? finalResult = _sentinel,
@@ -68,15 +74,15 @@ class VerificationSession {
     return VerificationSession(
       stage: stage ?? this.stage,
       steps: steps ?? this.steps,
+      faceImagePaths: faceImagePaths ?? this.faceImagePaths,
+      irisImagePaths: irisImagePaths ?? this.irisImagePaths,
       irisImagePath: identical(irisImagePath, _sentinel)
           ? this.irisImagePath
           : irisImagePath as String?,
-      blinkImagePath: identical(blinkImagePath, _sentinel)
-          ? this.blinkImagePath
-          : blinkImagePath as String?,
       voiceFilePath: identical(voiceFilePath, _sentinel)
           ? this.voiceFilePath
           : voiceFilePath as String?,
+      voiceFilePaths: voiceFilePaths ?? this.voiceFilePaths,
       irisResult: identical(irisResult, _sentinel)
           ? this.irisResult
           : irisResult as IrisTestResult?,

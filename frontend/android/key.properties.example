@@ -1,0 +1,4 @@
+storePassword=replace-with-secure-store-password
+keyPassword=replace-with-secure-key-password
+keyAlias=upload
+storeFile=C:/secure/path/to/upload-keystore.jks

@@ -1,11 +1,7 @@
 import 'package:flutter/material.dart';
 
 class StatusPill extends StatelessWidget {
-  const StatusPill({
-    super.key,
-    required this.label,
-    required this.color,
-  });
+  const StatusPill({super.key, required this.label, required this.color});
 
   final String label;
   final Color color;
@@ -21,10 +17,7 @@ class StatusPill extends StatelessWidget {
       ),
       child: Text(
         label,
-        style: TextStyle(
-          color: color,
-          fontWeight: FontWeight.w700,
-        ),
+        style: TextStyle(color: color, fontWeight: FontWeight.w700),
       ),
     );
   }

@@ -4,10 +4,7 @@ import '../../features/irl_verification/models/verification_step.dart';
 import 'verification_check_item.dart';
 
 class VerificationProgressStepper extends StatelessWidget {
-  const VerificationProgressStepper({
-    super.key,
-    required this.steps,
-  });
+  const VerificationProgressStepper({super.key, required this.steps});
 
   final List<VerificationStep> steps;
 

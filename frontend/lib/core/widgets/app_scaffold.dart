@@ -17,7 +17,7 @@ class AppScaffold extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final width = MediaQuery.sizeOf(context).width;
-    final useDrawer = width < AppConstants.mobileBreakpoint;
+    final useDrawer = width < AppConstants.navigationBreakpoint;
     final scaffoldKey = GlobalKey<ScaffoldState>();
 
     return Scaffold(
@@ -36,10 +36,7 @@ class AppScaffold extends StatelessWidget {
           alignment: Alignment.topCenter,
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 1280),
-            child: Padding(
-              padding: const EdgeInsets.all(20),
-              child: child,
-            ),
+            child: Padding(padding: const EdgeInsets.all(20), child: child),
           ),
         ),
       ),

@@ -1,7 +1,8 @@
 class VerificationConstants {
   const VerificationConstants._();
 
-  static const int minVoiceSeconds = 2;
+  // Two non-overlapping ECAPA segments are aggregated by the backend.
+  static const int minVoiceSeconds = 4;
   static const int maxVoiceSeconds = 15;
   static const Duration voiceCountdown = Duration(seconds: 3);
   static const Duration statusTick = Duration(milliseconds: 700);

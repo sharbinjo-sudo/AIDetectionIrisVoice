@@ -4,8 +4,14 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
+    <!-- Keep installation available on devices where a camera or microphone
+         is temporarily unavailable; the app reports capability errors at
+         runtime instead of being filtered incorrectly by the Play Store. -->
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
     <application
-        android:label="BioFusion AI"
+        android:label="Advanced Human Recognition"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:networkSecurityConfig="@xml/network_security_config"

@@ -2,6 +2,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../features/home/presentation/home_page.dart';
+import '../../features/home/presentation/banking_auth_page.dart';
 import '../../features/irl_verification/presentation/irl_page.dart';
 import '../../features/irl_verification/presentation/verification_result_page.dart';
 import '../../features/settings/presentation/settings_page.dart';
@@ -15,15 +16,23 @@ final routerProvider = Provider<GoRouter>((ref) {
     initialLocation: '/',
     routes: [
       ShellRoute(
-        builder: (context, state, child) => AppScaffold(
-          currentLocation: state.uri.path,
-          child: child,
-        ),
+        builder: (context, state, child) =>
+            AppScaffold(currentLocation: state.uri.path, child: child),
         routes: [
           GoRoute(
             path: '/',
             name: RouteNames.home,
             builder: (context, state) => const HomePage(),
+          ),
+          GoRoute(
+            path: '/login',
+            name: RouteNames.login,
+            builder: (context, state) => const BankingAuthPage.login(),
+          ),
+          GoRoute(
+            path: '/register',
+            name: RouteNames.register,
+            builder: (context, state) => const BankingAuthPage.register(),
           ),
           GoRoute(
             path: '/test',
@@ -33,7 +42,19 @@ final routerProvider = Provider<GoRouter>((ref) {
           GoRoute(
             path: '/irl',
             name: RouteNames.irl,
-            builder: (context, state) => const IrlPage(),
+            redirect: (context, state) {
+              final flow = state.uri.queryParameters['flow'];
+              final userId = state.uri.queryParameters['user'];
+              final validFlow = flow == 'enrollment' || flow == 'verification';
+              return validFlow && userId != null && userId.isNotEmpty
+                  ? null
+                  : '/';
+            },
+            builder: (context, state) => IrlPage(
+              flow: state.uri.queryParameters['flow']!,
+              userId: state.uri.queryParameters['user'],
+              initialEyeSide: state.uri.queryParameters['eye'],
+            ),
             routes: [
               GoRoute(
                 path: 'result',

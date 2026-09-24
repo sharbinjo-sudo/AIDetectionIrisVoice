@@ -1,9 +1,5 @@
 class AppException implements Exception {
-  AppException({
-    required this.message,
-    this.code,
-    this.details,
-  });
+  AppException({required this.message, this.code, this.details});
 
   final String message;
   final String? code;

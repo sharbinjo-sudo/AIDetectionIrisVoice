@@ -23,7 +23,7 @@ class ResponsiveNavbar extends ConsumerWidget implements PreferredSizeWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final width = MediaQuery.sizeOf(context).width;
-    final mobile = width < AppConstants.mobileBreakpoint;
+    final mobile = width < AppConstants.navigationBreakpoint;
 
     return AppBar(
       titleSpacing: 20,
@@ -45,16 +45,26 @@ class ResponsiveNavbar extends ConsumerWidget implements PreferredSizeWidget {
             child: const Icon(Icons.verified_user_rounded, color: Colors.white),
           ),
           const SizedBox(width: 12),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: const [
-              Text('BioFusion AI', style: TextStyle(fontWeight: FontWeight.w700)),
-              Text(
-                'Voice and Iris Identity Verification',
-                style: TextStyle(fontSize: 12),
-              ),
-            ],
+          Flexible(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  'Advanced Human Recognition',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontWeight: FontWeight.w700),
+                ),
+                if (!mobile)
+                  const Text(
+                    'Using AI and Multibiometric Authentication',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 12),
+                  ),
+              ],
+            ),
           ),
         ],
       ),
@@ -70,25 +80,20 @@ class ResponsiveNavbar extends ConsumerWidget implements PreferredSizeWidget {
             selected: _selected('/test'),
             onTap: () => context.goNamed(RouteNames.test),
           ),
-          _NavItem(
-            label: 'IRL',
-            selected: _selected('/irl'),
-            onTap: () => context.goNamed(RouteNames.irl),
-          ),
           const SizedBox(width: 8),
         ],
-        const BackendStatusBadge(),
-        const SizedBox(width: 8),
+        if (!mobile) ...[const BackendStatusBadge(), const SizedBox(width: 8)],
         IconButton(
           tooltip: 'Toggle theme',
           onPressed: () => ref.read(settingsProvider.notifier).toggleTheme(),
           icon: const Icon(Icons.contrast_rounded),
         ),
-        IconButton(
-          tooltip: 'Settings',
-          onPressed: () => context.goNamed(RouteNames.settings),
-          icon: const Icon(Icons.tune_rounded),
-        ),
+        if (!mobile)
+          IconButton(
+            tooltip: 'Settings',
+            onPressed: () => context.goNamed(RouteNames.settings),
+            icon: const Icon(Icons.tune_rounded),
+          ),
         const SizedBox(width: 8),
       ],
     );

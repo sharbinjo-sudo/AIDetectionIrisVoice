@@ -9,6 +9,7 @@ import 'package:record/record.dart';
 
 import '../../../../core/constants/app_constants.dart';
 import '../../../../core/constants/verification_constants.dart';
+import '../../../../core/io/local_file_cleanup.dart';
 import '../../../../shared/widgets/permission_request_card.dart';
 import '../../../../shared/widgets/voice_waveform.dart';
 
@@ -34,7 +35,8 @@ class VoiceRecorderPanel extends StatefulWidget {
   State<VoiceRecorderPanel> createState() => _VoiceRecorderPanelState();
 }
 
-class _VoiceRecorderPanelState extends State<VoiceRecorderPanel> {
+class _VoiceRecorderPanelState extends State<VoiceRecorderPanel>
+    with WidgetsBindingObserver {
   static const _sampleRate = 16000;
   static const _channels = 1;
   static const _speechLevelThreshold = 0.12;
@@ -45,6 +47,7 @@ class _VoiceRecorderPanelState extends State<VoiceRecorderPanel> {
   Timer? _recordingTimer;
   Timer? _countdownTimer;
   bool _permissionDenied = false;
+  bool _permissionPermanentlyDenied = false;
   bool _recording = false;
   bool _autoStarted = false;
   int _elapsedSeconds = 0;
@@ -58,6 +61,7 @@ class _VoiceRecorderPanelState extends State<VoiceRecorderPanel> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     if (widget.autoStartRecording) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _prepareAutoStart();
@@ -65,16 +69,49 @@ class _VoiceRecorderPanelState extends State<VoiceRecorderPanel> {
     }
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached) {
+      unawaited(_abortForLifecycle());
+    }
+  }
+
+  Future<void> _abortForLifecycle() async {
+    _countdownTimer?.cancel();
+    _recordingTimer?.cancel();
+    await _amplitudeSubscription?.cancel();
+    if (_recording) {
+      try {
+        await _recorder.cancel();
+      } catch (_) {
+        // Android may already have reclaimed the microphone.
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      _recording = false;
+      _countdownValue = null;
+      _amplitude = 0.05;
+      _runtimeError =
+          'Recording was stopped when the app left the foreground. Start again when ready.';
+    });
+  }
+
   Future<void> _requestPermission() async {
     try {
+      final status = kIsWeb ? null : await Permission.microphone.request();
       final granted = kIsWeb
           ? await _recorder.hasPermission()
-          : (await Permission.microphone.request()).isGranted;
+          : status!.isGranted;
       if (!mounted) {
         return;
       }
       setState(() {
         _permissionDenied = !granted;
+        _permissionPermanentlyDenied = status?.isPermanentlyDenied == true;
         _runtimeError = granted
             ? null
             : 'Microphone permission was denied. Allow microphone access and try again.';
@@ -123,7 +160,7 @@ class _VoiceRecorderPanelState extends State<VoiceRecorderPanel> {
     final wavSupported = await _recorder.isEncoderSupported(AudioEncoder.wav);
     if (!wavSupported) {
       throw StateError(
-        'WAV recording is not supported on this browser/device. Use Chrome or Edge on localhost for the pretrained voice model.',
+        'WAV recording is not supported on this browser/device. Use Chrome or Edge on localhost for the local voice model.',
       );
     }
 
@@ -177,6 +214,11 @@ class _VoiceRecorderPanelState extends State<VoiceRecorderPanel> {
       final config = await _buildRecordConfig();
       final path = await _newRecordingPath();
 
+      final previousPath = _currentRecordingPath;
+      if (previousPath != null && previousPath != widget.recordedPath) {
+        await deleteLocalFileIfExists(previousPath);
+      }
+
       await _recorder.start(config, path: path);
 
       setState(() {
@@ -192,7 +234,7 @@ class _VoiceRecorderPanelState extends State<VoiceRecorderPanel> {
 
       _amplitudeSubscription?.cancel();
       _amplitudeSubscription = _recorder
-          .onAmplitudeChanged(const Duration(milliseconds: 140))
+          .onAmplitudeChanged(const Duration(milliseconds: 60))
           .listen(
             (value) {
               if (!mounted) {
@@ -313,6 +355,7 @@ class _VoiceRecorderPanelState extends State<VoiceRecorderPanel> {
 
   Future<void> _retake() async {
     await _player.stop();
+    final previousPath = _currentRecordingPath;
     setState(() {
       _currentRecordingPath = null;
       _elapsedSeconds = 0;
@@ -324,6 +367,9 @@ class _VoiceRecorderPanelState extends State<VoiceRecorderPanel> {
       _runtimeError = null;
     });
     widget.onRetake();
+    if (previousPath != null) {
+      await deleteLocalFileIfExists(previousPath);
+    }
     if (widget.autoStartRecording) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _prepareAutoStart();
@@ -333,6 +379,7 @@ class _VoiceRecorderPanelState extends State<VoiceRecorderPanel> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _recordingTimer?.cancel();
     _countdownTimer?.cancel();
     _amplitudeSubscription?.cancel();
@@ -349,7 +396,14 @@ class _VoiceRecorderPanelState extends State<VoiceRecorderPanel> {
         message:
             _runtimeError ??
             'Microphone access is required for the spoken human challenge.',
-        onRequest: _requestPermission,
+        onRequest: _permissionPermanentlyDenied
+            ? () async {
+                await openAppSettings();
+              }
+            : _requestPermission,
+        actionLabel: _permissionPermanentlyDenied
+            ? 'Open app settings'
+            : 'Grant access',
       );
     }
 

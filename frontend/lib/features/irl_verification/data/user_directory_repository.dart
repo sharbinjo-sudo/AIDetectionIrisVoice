@@ -20,7 +20,8 @@ class UserDirectoryRepository {
       final payload = response.data is Map<String, dynamic>
           ? response.data as Map<String, dynamic>
           : <String, dynamic>{};
-      final rawList = payload['data']?['results'] ??
+      final rawList =
+          payload['data']?['results'] ??
           payload['data'] ??
           payload['results'] ??
           payload;
@@ -39,8 +40,9 @@ class UserDirectoryRepository {
 
   Future<String> fetchEnrollmentStatus(String userId) async {
     try {
-      final response =
-          await _dio.get<dynamic>(ApiEndpoints.enrollmentStatus(userId));
+      final response = await _dio.get<dynamic>(
+        ApiEndpoints.enrollmentStatus(userId),
+      );
       final payload = response.data is Map<String, dynamic>
           ? response.data as Map<String, dynamic>
           : <String, dynamic>{};

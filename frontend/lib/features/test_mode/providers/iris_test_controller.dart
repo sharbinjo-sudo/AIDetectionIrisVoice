@@ -1,14 +1,14 @@
-import 'dart:io';
-
-import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/constants/verification_constants.dart';
+import '../../../core/io/local_file_cleanup.dart';
 import '../../../core/networking/dio_client.dart';
 import '../data/test_repository.dart';
 import '../models/iris_test_result.dart';
 
 enum TestComparisonMode { qualityOnly }
+
+const _sentinel = Object();
 
 class IrisTestState {
   const IrisTestState({
@@ -32,29 +32,35 @@ class IrisTestState {
   final double uploadProgress;
 
   factory IrisTestState.initial() => const IrisTestState(
-        mode: TestComparisonMode.qualityOnly,
-        isProcessing: false,
-        processingStages: [],
-      );
+    mode: TestComparisonMode.qualityOnly,
+    isProcessing: false,
+    processingStages: [],
+  );
 
   IrisTestState copyWith({
     TestComparisonMode? mode,
     bool? isProcessing,
     List<String>? processingStages,
-    String? capturedImagePath,
+    Object? capturedImagePath = _sentinel,
     String? eyeSide,
-    IrisTestResult? result,
-    String? errorMessage,
+    Object? result = _sentinel,
+    Object? errorMessage = _sentinel,
     double? uploadProgress,
   }) {
     return IrisTestState(
       mode: mode ?? this.mode,
       isProcessing: isProcessing ?? this.isProcessing,
       processingStages: processingStages ?? this.processingStages,
-      capturedImagePath: capturedImagePath ?? this.capturedImagePath,
+      capturedImagePath: identical(capturedImagePath, _sentinel)
+          ? this.capturedImagePath
+          : capturedImagePath as String?,
       eyeSide: eyeSide ?? this.eyeSide,
-      result: result ?? this.result,
-      errorMessage: errorMessage,
+      result: identical(result, _sentinel)
+          ? this.result
+          : result as IrisTestResult?,
+      errorMessage: identical(errorMessage, _sentinel)
+          ? this.errorMessage
+          : errorMessage as String?,
       uploadProgress: uploadProgress ?? this.uploadProgress,
     );
   }
@@ -71,17 +77,20 @@ class IrisTestController extends Notifier<IrisTestState> {
   }
 
   void setCapturedImage(String path) {
-    state = state.copyWith(capturedImagePath: path, result: null, errorMessage: null);
+    state = state.copyWith(
+      capturedImagePath: path,
+      result: null,
+      errorMessage: null,
+    );
   }
 
   Future<void> clearCapture() async {
-    if (!kIsWeb && state.capturedImagePath != null) {
-      final file = File(state.capturedImagePath!);
-      if (await file.exists()) {
-        await file.delete();
-      }
-    }
-    state = state.copyWith(capturedImagePath: null, result: null, errorMessage: null);
+    await deleteLocalFileIfExists(state.capturedImagePath);
+    state = state.copyWith(
+      capturedImagePath: null,
+      result: null,
+      errorMessage: null,
+    );
   }
 
   Future<void> analyze() async {
@@ -104,9 +113,7 @@ class IrisTestController extends Notifier<IrisTestState> {
         imagePath: imagePath,
         eyeSide: state.eyeSide,
         onSendProgress: (sent, total) {
-          state = state.copyWith(
-            uploadProgress: total == 0 ? 0 : sent / total,
-          );
+          state = state.copyWith(uploadProgress: total == 0 ? 0 : sent / total);
         },
       );
       state = state.copyWith(
@@ -124,5 +131,6 @@ class IrisTestController extends Notifier<IrisTestState> {
   }
 }
 
-final irisTestProvider =
-    NotifierProvider<IrisTestController, IrisTestState>(IrisTestController.new);
+final irisTestProvider = NotifierProvider<IrisTestController, IrisTestState>(
+  IrisTestController.new,
+);

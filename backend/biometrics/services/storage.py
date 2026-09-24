@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -27,3 +27,15 @@ def temporary_upload(uploaded_file, prefix: str, suffix: str):
     finally:
         if not settings.RETAIN_PROCESSED_UPLOADS and temp_path.exists():
             temp_path.unlink(missing_ok=True)
+
+
+@contextmanager
+def temporary_uploads(uploaded_files, prefix: str, suffix: str):
+    with ExitStack() as stack:
+        paths = [
+            stack.enter_context(
+                temporary_upload(upload, prefix=f"{prefix}{index}_", suffix=suffix)
+            )
+            for index, upload in enumerate(uploaded_files)
+        ]
+        yield paths

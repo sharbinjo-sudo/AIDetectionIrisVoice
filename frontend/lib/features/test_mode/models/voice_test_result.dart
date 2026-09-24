@@ -42,9 +42,10 @@ class VoiceTestResult {
       passed: voice['passed'] == true,
       processingTimeMs:
           (json['processing_time_ms'] as num?)?.toInt() ??
-              (voice['processing_time_ms'] as num?)?.toInt() ??
-              0,
-      message: json['message']?.toString() ??
+          (voice['processing_time_ms'] as num?)?.toInt() ??
+          0,
+      message:
+          json['message']?.toString() ??
           json['failure_reason']?.toString() ??
           voice['message']?.toString() ??
           '',

@@ -30,9 +30,10 @@ class IrisTestResult {
       passed: iris['passed'] == true,
       processingTimeMs:
           (json['processing_time_ms'] as num?)?.toInt() ??
-              (iris['processing_time_ms'] as num?)?.toInt() ??
-              0,
-      message: json['message']?.toString() ??
+          (iris['processing_time_ms'] as num?)?.toInt() ??
+          0,
+      message:
+          json['message']?.toString() ??
           json['failure_reason']?.toString() ??
           iris['message']?.toString() ??
           '',

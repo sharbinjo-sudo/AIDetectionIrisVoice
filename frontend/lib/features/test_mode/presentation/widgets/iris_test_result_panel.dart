@@ -3,10 +3,7 @@ import 'package:flutter/material.dart';
 import '../../models/iris_test_result.dart';
 
 class IrisTestResultPanel extends StatelessWidget {
-  const IrisTestResultPanel({
-    super.key,
-    required this.result,
-  });
+  const IrisTestResultPanel({super.key, required this.result});
 
   final IrisTestResult result;
 
@@ -24,12 +21,14 @@ class IrisTestResultPanel extends StatelessWidget {
             Text('Threshold: ${_fmt(result.threshold)}'),
             Text('Passed: ${result.passed ? 'Yes' : 'No'}'),
             Text('Processing time: ${result.processingTimeMs} ms'),
-            if (result.message.isNotEmpty) Text('Backend message: ${result.message}'),
+            if (result.message.isNotEmpty)
+              Text('Backend message: ${result.message}'),
           ],
         ),
       ),
     );
   }
 
-  String _fmt(double? value) => value == null ? 'N/A' : value.toStringAsFixed(2);
+  String _fmt(double? value) =>
+      value == null ? 'N/A' : value.toStringAsFixed(2);
 }

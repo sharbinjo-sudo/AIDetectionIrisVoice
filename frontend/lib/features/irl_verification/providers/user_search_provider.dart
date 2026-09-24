@@ -21,11 +21,8 @@ class UserSearchState {
   final bool isLoading;
   final String? error;
 
-  factory UserSearchState.initial() => const UserSearchState(
-        query: '',
-        users: [],
-        isLoading: false,
-      );
+  factory UserSearchState.initial() =>
+      const UserSearchState(query: '', users: [], isLoading: false);
 
   UserSearchState copyWith({
     String? query,
@@ -52,18 +49,17 @@ class UserSearchController extends Notifier<UserSearchState> {
   Future<void> loadUsers([String query = '']) async {
     state = state.copyWith(query: query, isLoading: true, error: null);
     try {
-      final users = await ref.read(userDirectoryRepositoryProvider).fetchUsers(query);
+      final users = await ref
+          .read(userDirectoryRepositoryProvider)
+          .fetchUsers(query);
       state = state.copyWith(users: users, isLoading: false, error: null);
     } catch (error) {
-      state = state.copyWith(
-        isLoading: false,
-        error: error.toString(),
-      );
+      state = state.copyWith(isLoading: false, error: error.toString());
     }
   }
 }
 
 final userSearchProvider =
     NotifierProvider<UserSearchController, UserSearchState>(
-  UserSearchController.new,
-);
+      UserSearchController.new,
+    );

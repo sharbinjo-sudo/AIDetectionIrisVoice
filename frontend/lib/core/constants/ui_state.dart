@@ -9,11 +9,7 @@ enum ViewStatus {
 }
 
 class ViewState<T> {
-  const ViewState({
-    required this.status,
-    this.data,
-    this.message,
-  });
+  const ViewState({required this.status, this.data, this.message});
 
   final ViewStatus status;
   final T? data;
@@ -30,18 +26,12 @@ class ViewState<T> {
   factory ViewState.empty([String? message]) =>
       ViewState(status: ViewStatus.empty, message: message);
   factory ViewState.validationError(String message, [T? data]) => ViewState(
-        status: ViewStatus.validationError,
-        message: message,
-        data: data,
-      );
-  factory ViewState.networkError(String message, [T? data]) => ViewState(
-        status: ViewStatus.networkError,
-        message: message,
-        data: data,
-      );
-  factory ViewState.serverError(String message, [T? data]) => ViewState(
-        status: ViewStatus.serverError,
-        message: message,
-        data: data,
-      );
+    status: ViewStatus.validationError,
+    message: message,
+    data: data,
+  );
+  factory ViewState.networkError(String message, [T? data]) =>
+      ViewState(status: ViewStatus.networkError, message: message, data: data);
+  factory ViewState.serverError(String message, [T? data]) =>
+      ViewState(status: ViewStatus.serverError, message: message, data: data);
 }

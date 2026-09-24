@@ -10,7 +10,10 @@ class BackendStatusBadge extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final health = ref.watch(backendHealthProvider);
-    final connected = health.valueOrNull?.connected == true;
+    final status = health.valueOrNull;
+    final connected = status?.connected == true;
+    final reachable = status?.reachable == true;
+    final checking = health.isLoading && status == null;
     final colour = connected ? AppColours.success : AppColours.warning;
 
     return Container(
@@ -26,11 +29,14 @@ class BackendStatusBadge extends ConsumerWidget {
           Icon(Icons.circle, size: 10, color: colour),
           const SizedBox(width: 8),
           Text(
-            connected ? 'Backend Connected' : 'Backend Offline',
-            style: TextStyle(
-              color: colour,
-              fontWeight: FontWeight.w600,
-            ),
+            checking
+                ? 'Connecting to Backend…'
+                : connected
+                ? 'Backend Connected'
+                : reachable
+                ? 'Backend Starting'
+                : 'Backend Offline',
+            style: TextStyle(color: colour, fontWeight: FontWeight.w600),
           ),
         ],
       ),

@@ -18,21 +18,42 @@
 
   <meta charset="UTF-8">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
-  <meta name="description" content="A new Flutter project.">
+  <meta name="description" content="General-purpose multibiometric authentication for account registration and login.">
+  <meta name="theme-color" content="#0B1F3A">
 
   <!-- iOS meta tags & icons -->
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black">
-  <meta name="apple-mobile-web-app-title" content="frontend">
+  <meta name="apple-mobile-web-app-title" content="BioFusion">
   <link rel="apple-touch-icon" href="icons/Icon-192.png">
 
   <!-- Favicon -->
   <link rel="icon" type="image/png" href="favicon.png"/>
 
-  <title>frontend</title>
+  <title>Advanced Human Recognition Using AI and Multibiometric Authentication</title>
   <link rel="manifest" href="manifest.json">
+  <style>
+    body { margin: 0; background: #091827; }
+    #startup { box-sizing: border-box; min-height: 100vh; display: grid;
+      place-content: center; padding: 28px; color: #eef4ff;
+      font: 16px/1.6 system-ui, sans-serif; text-align: center; }
+    #startup section { max-width: 540px; }
+    #startup h1 { font-size: 25px; line-height: 1.3; }
+    #startup p { color: #bac9df; }
+    #startup button { background: #287be0; color: white; border: 0;
+      border-radius: 12px; padding: 12px 24px; font: inherit; cursor: pointer; }
+  </style>
 </head>
 <body>
+  <div id="startup" role="status" aria-live="polite">
+    <section>
+      <h1 id="startup-title">Starting biometric authentication</h1>
+      <p id="startup-detail">Loading the local application. Please wait...</p>
+      <button id="startup-retry" hidden>Reload application</button>
+      <noscript>This application requires JavaScript. Enable it and reload.</noscript>
+    </section>
+  </div>
+  <script src="startup.js"></script>
   <!--
     You can customize the "flutter_bootstrap.js" script.
     This is useful to provide a custom configuration to the Flutter loader
@@ -41,6 +62,6 @@
     For more details:
     * https://docs.flutter.dev/platform-integration/web/initialization
   -->
-  <script src="flutter_bootstrap.js" async></script>
+  <script src="flutter_bootstrap.js" async onerror="window.showStartupFailure()"></script>
 </body>
 </html>

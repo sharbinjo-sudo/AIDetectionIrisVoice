@@ -3,11 +3,7 @@ import 'package:flutter/material.dart';
 import '../theme/app_colours.dart';
 
 class ErrorPanel extends StatelessWidget {
-  const ErrorPanel({
-    super.key,
-    required this.message,
-    this.onRetry,
-  });
+  const ErrorPanel({super.key, required this.message, this.onRetry});
 
   final String message;
   final VoidCallback? onRetry;

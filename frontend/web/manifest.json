@@ -1,12 +1,11 @@
 {
-    "name": "frontend",
-    "short_name": "frontend",
+    "name": "Advanced Human Recognition Using AI and Multibiometric Authentication",
+    "short_name": "BioFusion",
     "start_url": ".",
     "display": "standalone",
-    "background_color": "#0175C2",
-    "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
-    "orientation": "portrait-primary",
+    "background_color": "#071525",
+    "theme_color": "#0B1F3A",
+    "description": "General-purpose multibiometric authentication for account registration and login.",
     "prefer_related_applications": false,
     "icons": [
         {

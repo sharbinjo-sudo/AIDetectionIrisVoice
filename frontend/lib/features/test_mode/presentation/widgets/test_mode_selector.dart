@@ -23,7 +23,7 @@ class TestModeSelector extends StatelessWidget {
             width: double.infinity,
             child: FilledButton(
               onPressed: () => onSelected(TestPanelType.iris),
-              child: const Text('Test Iris Camera'),
+              child: const Text('Test Iris Quality'),
             ),
           ),
           const SizedBox(height: 12),
@@ -31,7 +31,7 @@ class TestModeSelector extends StatelessWidget {
             width: double.infinity,
             child: OutlinedButton(
               onPressed: () => onSelected(TestPanelType.voice),
-              child: const Text('Test Voice Recognition'),
+              child: const Text('Test Voice Quality'),
             ),
           ),
         ],
@@ -42,12 +42,12 @@ class TestModeSelector extends StatelessWidget {
       segments: const [
         ButtonSegment(
           value: TestPanelType.iris,
-          label: Text('Test Iris Camera'),
+          label: Text('Test Iris Quality'),
           icon: Icon(Icons.visibility_rounded),
         ),
         ButtonSegment(
           value: TestPanelType.voice,
-          label: Text('Test Voice Recognition'),
+          label: Text('Test Voice Quality'),
           icon: Icon(Icons.graphic_eq_rounded),
         ),
       ],

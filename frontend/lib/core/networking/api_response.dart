@@ -1,9 +1,5 @@
 class ApiResponse<T> {
-  const ApiResponse({
-    required this.success,
-    required this.data,
-    this.message,
-  });
+  const ApiResponse({required this.success, required this.data, this.message});
 
   final bool success;
   final T data;

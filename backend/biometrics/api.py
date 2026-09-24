@@ -9,7 +9,9 @@ def _flatten_error_detail(detail) -> str:
         for field, value in detail.items():
             flattened = _flatten_error_detail(value)
             if flattened:
-                messages.append(f"{field}: {flattened}")
+                messages.append(
+                    flattened if field == "non_field_errors" else f"{field}: {flattened}"
+                )
         return "; ".join(messages)
     if isinstance(detail, list):
         return ", ".join(filter(None, (_flatten_error_detail(item) for item in detail)))

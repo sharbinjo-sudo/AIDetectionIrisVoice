@@ -20,6 +20,12 @@ def ensure_remote_asset(
     if destination.exists():
         return destination
 
+    if settings.BIOMETRIC_OFFLINE_MODE:
+        raise ModelUnavailableError(
+            f"The local {description} asset is missing at {destination}. "
+            "Install the model files before running offline; no download was attempted."
+        )
+
     destination.parent.mkdir(parents=True, exist_ok=True)
     last_error: Exception | None = None
 
@@ -48,7 +54,7 @@ def ensure_remote_asset(
 
     detail = str(last_error) if last_error else "unknown download error"
     raise ModelUnavailableError(
-        f"Unable to download the pretrained {description}. Check your internet connection and model URL settings. Detail: {detail}"
+        f"Unable to provision the {description}. Check the model asset path or provisioning settings. Detail: {detail}"
     )
 
 

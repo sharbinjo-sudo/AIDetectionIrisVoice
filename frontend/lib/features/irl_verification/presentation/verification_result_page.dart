@@ -20,26 +20,59 @@ class VerificationResultPage extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final result = payload.result;
     final verified = result.accepted;
+    final width = MediaQuery.sizeOf(context).width;
+    final irisCaptureOnly =
+        result.fusion.irisWeight == 0 &&
+        result.reasonCode == 'FACE_VOICE_VALID_IRIS_CAPTURE_ONLY';
+
+    // "Biometric Verification Failed" is reserved for actual mismatch or
+    // spoof evidence. Quality/retry outcomes show guidance instead.
+    final Widget panel;
+    if (verified) {
+      panel = VerifiedSuccessPanel(irisCaptureOnly: irisCaptureOnly);
+    } else if (result.rejectedMismatch || result.rejectedSpoof) {
+      panel = VerificationFailedPanel(
+        message:
+            result.failureReason ??
+            result.reasonMessage ??
+            'The verification checks did not pass.',
+        rejectionType: result.rejectedSpoof
+            ? RejectionType.spoof
+            : RejectionType.mismatch,
+      );
+    } else if (result.processingError) {
+      panel = VerificationFailedPanel(
+        message:
+            result.failureReason ??
+            'Verification could not complete. Please try again.',
+        retryRequired: true,
+      );
+    } else {
+      // RETRY_REQUIRED / QUALITY_TOO_LOW: poor capture, not identity evidence.
+      panel = VerificationFailedPanel(
+        retryRequired: true,
+        message:
+            result.failureReason ??
+            result.reasonMessage ??
+            'Capture quality is insufficient. Retake the affected capture.',
+        qualityDetail: _qualityDetail(result, irisCaptureOnly),
+      );
+    }
+
     return ListView(
+      key: const PageStorageKey<String>('verification-result'),
       children: [
         Card(
           child: Padding(
             padding: const EdgeInsets.all(24),
             child: Column(
               children: [
-                if (verified)
-                  const VerifiedSuccessPanel()
-                else
-                  VerificationFailedPanel(
-                    message:
-                        result.failureReason ??
-                        'The blink and speech challenge did not meet the required threshold.',
-                  ),
+                panel,
                 const SizedBox(height: 20),
                 Text('Processing time: ${result.processingTimeMs} ms'),
                 const SizedBox(height: 8),
                 const Text(
-                  'No biometric media or completed verification result was saved to the app.',
+                  'Biometric media is deleted after processing. Diagnostic scores and the decision may be recorded locally for auditing.',
                   textAlign: TextAlign.center,
                 ),
               ],
@@ -48,29 +81,36 @@ class VerificationResultPage extends ConsumerWidget {
         ),
         const SizedBox(height: 16),
         GridView.count(
-          crossAxisCount: MediaQuery.sizeOf(context).width > 900 ? 3 : 1,
+          crossAxisCount: width > 1100
+              ? 3
+              : width > 700
+              ? 2
+              : 1,
           shrinkWrap: true,
           physics: const NeverScrollableScrollPhysics(),
           crossAxisSpacing: 16,
           mainAxisSpacing: 16,
-          childAspectRatio: 1.45,
+          mainAxisExtent: width > 700 ? 290 : 270,
           children: [
             BiometricScoreCard(
-              label: 'Speech score',
+              label: 'Iris verification',
+              value: result.face.normalizedScore,
+              detail: _irisDetail(result.face),
+            ),
+            BiometricScoreCard(
+              label: 'Voice verification',
               value: result.voice.normalizedScore,
               detail: _voiceDetail(result.voice),
             ),
             BiometricScoreCard(
-              label: 'Blink score',
-              value: result.iris.normalizedScore,
-              detail: _metricDetail(result.iris, name: 'Blink'),
-            ),
-            BiometricScoreCard(
-              label: 'Final human score',
+              label: 'Overall authentication',
               value: result.fusion.score,
               detail:
-                  'Needs ${_percent(result.fusion.threshold)} or higher. '
-                  '${result.fusion.score >= result.fusion.threshold ? 'Passed' : 'Failed'}.',
+                  'Quality-adjusted threshold ${_percent(result.fusion.threshold)}. '
+                  '${result.fusion.score >= result.fusion.threshold ? 'Passed' : 'Not met'}. '
+                  'Iris weight ${_percent(result.fusion.faceWeight)}, '
+                  'voice weight ${_percent(result.fusion.voiceWeight)}. '
+                  'Status: ${verified ? 'VERIFIED' : result.decision}.',
             ),
           ],
         ),
@@ -79,7 +119,10 @@ class VerificationResultPage extends ConsumerWidget {
           child: Padding(
             padding: const EdgeInsets.all(18),
             child: Text(
-              'Success does not require 100%. Voice quality, spoken activity, blink quality, and the final human score each need to pass their thresholds.',
+              'Similarity values are normalized template-matching scores, not calibrated probabilities or proof of human liveness. '
+              'Capture quality is shown separately. Low-quality captures request a retake; '
+              'a mismatch is reported only when usable iris or voice measurements disagree with enrolled templates. '
+              'Dedicated anti-spoofing is reported separately and is not currently claimed by identity matching.',
               style: Theme.of(context).textTheme.bodyMedium,
             ),
           ),
@@ -90,10 +133,21 @@ class VerificationResultPage extends ConsumerWidget {
           runSpacing: 12,
           children: [
             SecondaryButton(
-              label: 'Start New Check',
+              label: verified
+                  ? 'Run Another Check'
+                  : (result.retryRequired
+                        ? 'Retry Capture'
+                        : 'Start New Check'),
               onPressed: () {
                 ref.read(verificationProvider.notifier).restart();
-                context.goNamed(RouteNames.irl);
+                context.goNamed(
+                  RouteNames.irl,
+                  queryParameters: {
+                    'flow': 'verification',
+                    'user': payload.userId,
+                    'eye': payload.eyeSide,
+                  },
+                );
               },
             ),
             SecondaryButton(
@@ -106,21 +160,65 @@ class VerificationResultPage extends ConsumerWidget {
     );
   }
 
-  String _voiceDetail(VerificationMetric voice) {
-    final parts = [
-      'Quality needs ${_percent(voice.threshold)}: ${voice.normalizedScore >= voice.threshold ? 'passed' : 'failed'}',
-    ];
-    if (voice.speechActivityScore != null && voice.activityThreshold != null) {
+  String _qualityDetail(VerificationResult result, bool irisCaptureOnly) {
+    final parts = <String>[];
+    final iris = result.face;
+    if (iris.validMeasurement == false) {
       parts.add(
-        'Spoken activity ${_percent(voice.speechActivityScore!)} / needs ${_percent(voice.activityThreshold!)}: ${voice.speechDetected == true ? 'passed' : 'failed'}',
+        'Iris capture was unavailable or unclear (quality ${_percent(iris.qualityScore ?? 0)}). '
+        'Use even lighting, keep one eye in frame, and look straight at the camera.',
+      );
+    }
+    final irisMetric = result.iris;
+    if (!irisCaptureOnly && irisMetric.validMeasurement == false) {
+      parts.add(
+        'Iris capture ${irisMetric.irisDetected == false ? 'did not detect an iris' : 'was unclear'} '
+        '(quality ${_percent(irisMetric.qualityScore ?? 0)}, minimum ${_percent(irisMetric.threshold)}). '
+        'Move closer, improve lighting, and hold steady.',
+      );
+    }
+    final voice = result.voice;
+    if (voice.validMeasurement == false) {
+      if (voice.speechDetected == false) {
+        parts.add('No clear speech was detected. Speak the phrase out loud.');
+      } else {
+        parts.add(
+          'Voice recording was unclear (quality ${_percent(voice.qualityScore ?? 0)}). '
+          'Speak clearly in a quiet place.',
+        );
+      }
+    }
+    if (parts.isEmpty) {
+      parts.add(
+        'Capture confidence was inconclusive. Retake both captures with better lighting and a steady eye.',
       );
     }
     return parts.join('\n');
   }
 
-  String _metricDetail(VerificationMetric metric, {required String name}) {
-    return '$name needs ${_percent(metric.threshold)} or higher. '
-        '${metric.passed ? 'Passed' : 'Failed'}.';
+  String _voiceDetail(VerificationMetric voice) {
+    final parts = [
+      'Similarity threshold ${_percent(voice.threshold)}. Capture quality '
+          '${_percent(voice.qualityScore ?? 0)} / minimum '
+          '${_percent(voice.qualityThreshold ?? 0)}.',
+    ];
+    if (voice.speechActivityScore != null && voice.activityThreshold != null) {
+      parts.add(
+        'Spoken activity ${_percent(voice.speechActivityScore!)} / needs ${_percent(voice.activityThreshold!)}: ${voice.speechDetected == true ? 'passed' : 'below threshold'}',
+      );
+    }
+    return parts.join('\n');
+  }
+
+  String _irisDetail(VerificationMetric iris) {
+    final availability = iris.validMeasurement == true
+        ? 'Available'
+        : 'Unavailable or low quality';
+    return 'Score threshold ${_percent(iris.threshold)}. Status: '
+        '${iris.passed ? 'PASS' : 'FAIL'}. Quality '
+        '${_percent(iris.qualityScore ?? 0)} / minimum '
+        '${_percent(iris.qualityThreshold ?? 0)}. $availability. '
+        '${iris.sampleCount ?? 0} frames aggregated.';
   }
 
   String _percent(double value) => '${(value * 100).toStringAsFixed(0)}%';

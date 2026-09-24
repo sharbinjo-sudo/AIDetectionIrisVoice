@@ -6,11 +6,13 @@ class PermissionRequestCard extends StatelessWidget {
     required this.title,
     required this.message,
     required this.onRequest,
+    this.actionLabel = 'Grant access',
   });
 
   final String title;
   final String message;
   final VoidCallback onRequest;
+  final String actionLabel;
 
   @override
   Widget build(BuildContext context) {
@@ -24,10 +26,7 @@ class PermissionRequestCard extends StatelessWidget {
             const SizedBox(height: 8),
             Text(message),
             const SizedBox(height: 16),
-            ElevatedButton(
-              onPressed: onRequest,
-              child: const Text('Grant access'),
-            ),
+            ElevatedButton(onPressed: onRequest, child: Text(actionLabel)),
           ],
         ),
       ),

@@ -1,15 +1,13 @@
 enum VerificationStage {
   idle,
   checkingPermissions,
+  readyForFace,
+  capturingFace,
+  faceFailed,
   readyForIris,
   capturingIris,
   processingIris,
   irisPassed,
-  readyForBlink,
-  capturingBlink,
-  processingBlink,
-  blinkPassed,
-  blinkFailed,
   irisFailed,
   readyForVoice,
   recordingVoice,
@@ -17,32 +15,25 @@ enum VerificationStage {
   voicePassed,
   voiceFailed,
   fusingScores,
+  qualityTooLow,
+  retryRequired,
+  verification,
   verified,
+  rejectedSpoof,
+  rejectedMismatch,
   rejected,
   processingError,
 }
 
-enum VerificationStepStatus {
-  pending,
-  processing,
-  passed,
-  failed,
-  unavailable,
-}
+enum VerificationStepStatus { pending, processing, passed, failed, unavailable }
 
 class VerificationStep {
-  const VerificationStep({
-    required this.label,
-    required this.status,
-  });
+  const VerificationStep({required this.label, required this.status});
 
   final String label;
   final VerificationStepStatus status;
 
   VerificationStep copyWith({VerificationStepStatus? status}) {
-    return VerificationStep(
-      label: label,
-      status: status ?? this.status,
-    );
+    return VerificationStep(label: label, status: status ?? this.status);
   }
 }

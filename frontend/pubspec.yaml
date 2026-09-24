@@ -1,5 +1,5 @@
 name: frontend
-description: BioFusion AI Flutter frontend for voice and iris identity verification.
+description: Advanced Human Recognition banking frontend for AI multibiometric authentication.
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -18,12 +18,12 @@ dependencies:
   path_provider: ^2.1.5
   record: ^6.2.1
   camera: ^0.11.4
-  google_fonts: ^6.3.1
   intl: ^0.20.2
   connectivity_plus: ^6.1.5
   audioplayers: ^6.1.0
   cross_file: ^0.3.4+2
   image: ^4.5.4
+  web: ^1.1.1
 
 dev_dependencies:
   flutter_test:
@@ -32,6 +32,14 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  fonts:
+    - family: Roboto
+      fonts:
+        - asset: assets/fonts/roboto-regular.ttf
+        - asset: assets/fonts/roboto-medium.ttf
+          weight: 500
+        - asset: assets/fonts/roboto-bold.ttf
+          weight: 700
   assets:
     - assets/images/
 

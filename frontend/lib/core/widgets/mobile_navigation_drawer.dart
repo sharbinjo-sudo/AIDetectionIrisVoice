@@ -4,10 +4,7 @@ import 'package:go_router/go_router.dart';
 import '../routing/route_names.dart';
 
 class MobileNavigationDrawer extends StatelessWidget {
-  const MobileNavigationDrawer({
-    super.key,
-    required this.currentLocation,
-  });
+  const MobileNavigationDrawer({super.key, required this.currentLocation});
 
   final String currentLocation;
 
@@ -22,7 +19,7 @@ class MobileNavigationDrawer extends StatelessWidget {
             child: Align(
               alignment: Alignment.bottomLeft,
               child: Text(
-                'BioFusion AI',
+                'Advanced Human Recognition',
                 style: TextStyle(fontSize: 24, fontWeight: FontWeight.w700),
               ),
             ),
@@ -45,13 +42,14 @@ class MobileNavigationDrawer extends StatelessWidget {
               context.goNamed(RouteNames.test);
             },
           ),
+          const Divider(),
           ListTile(
-            selected: _selected('/irl'),
-            leading: const Icon(Icons.verified_rounded),
-            title: const Text('IRL'),
+            selected: _selected('/settings'),
+            leading: const Icon(Icons.tune_rounded),
+            title: const Text('Settings'),
             onTap: () {
               Navigator.of(context).pop();
-              context.goNamed(RouteNames.irl);
+              context.goNamed(RouteNames.settings);
             },
           ),
         ],
