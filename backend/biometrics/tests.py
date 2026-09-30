@@ -27,6 +27,7 @@ from .services.engines import IrisSample, VoiceSample
 from .services.exceptions import ModelUnavailableError, SpoofDetectedError
 from .services.face_engine import FaceSample
 from .services.face_liveness import FaceLivenessEngine, LivenessResult
+from .services.face_liveness import summarize_liveness
 from .services.fusion import (
     FusionInputs,
     ModalityMeasurement,
@@ -901,6 +902,9 @@ class FaceLivenessEngineTests(TestCase):
     def test_live_face_passes_with_dedicated_model(self):
         import numpy as np
 
+        # Upstream convention (yakhyo/face-anti-spoofing onnx_inference.py):
+        # class index 1 = Real, established by the A/B/C diagnostic on a real
+        # webcam frame with raw 0-255 input (not by the HF model card).
         engine = self._engine([[0.1, 6.0, 0.2]])
         image = np.full((200, 200, 3), 128, dtype=np.uint8)
         result = engine.assess(image, [40, 40, 160, 160])
@@ -918,12 +922,121 @@ class FaceLivenessEngineTests(TestCase):
     def test_spoof_face_is_rejected(self):
         import numpy as np
 
+        # Spoof evidence on a non-live class (0 here) must reject.
         engine = self._engine([[6.0, 0.1, 0.2]])
         image = np.full((200, 200, 3), 128, dtype=np.uint8)
         result = engine.assess(image, [40, 40, 160, 160])
         self.assertTrue(result.evaluated)
         self.assertFalse(result.passed)
         self.assertEqual(result.status, "SPOOF")
+
+    @override_settings(
+        FACE_LIVENESS_ACTIVATION="softmax",
+        FACE_LIVENESS_LIVE_INDEX=1,
+        FACE_LIVENESS_THRESHOLD=0.60,
+    )
+    def test_blob_preserves_bgr_channel_order(self):
+        """The ONNX model expects BGR, so blobFromImage must not swap channels."""
+        import cv2
+        import numpy as np
+
+        engine = self._engine([[0.1, 6.0, 0.2]])
+        image = np.full((200, 200, 3), 128, dtype=np.uint8)
+        engine.assess(image, [40, 40, 160, 160])
+        blob = engine._net.input
+        self.assertEqual(blob.shape, (1, 3, 80, 80))
+        self.assertEqual(blob.dtype, np.float32)
+        expected = cv2.dnn.blobFromImage(
+            np.full((80, 80, 3), 128, dtype=np.uint8),
+            scalefactor=1.0,
+            size=(80, 80),
+            mean=(0.0, 0.0, 0.0),
+            swapRB=False,
+        )
+        np.testing.assert_allclose(blob, expected)
+
+    @override_settings(
+        FACE_LIVENESS_ACTIVATION="softmax",
+        FACE_LIVENESS_LIVE_INDEX=1,
+        FACE_LIVENESS_THRESHOLD=0.60,
+    )
+    def test_blob_uses_raw_pixel_values_not_normalized(self):
+        """Upstream MiniFASNet inference takes raw 0-255 float32, never /255."""
+        import numpy as np
+
+        engine = self._engine([[0.1, 6.0, 0.2]])
+        image = np.full((200, 200, 3), 200, dtype=np.uint8)
+        engine.assess(image, [40, 40, 160, 160])
+        blob = engine._net.input
+        self.assertAlmostEqual(float(blob.max()), 200.0, places=3)
+        self.assertGreater(float(blob.min()), 0.0)
+
+    @override_settings(
+        FACE_LIVENESS_ACTIVATION="softmax",
+        FACE_LIVENESS_LIVE_INDEX=1,
+        FACE_LIVENESS_THRESHOLD=0.60,
+    )
+    def test_assessment_reports_logits_softmax_and_class_diagnostics(self):
+        """Score diagnostics cover logits, softmax, predicted class, probabilities."""
+        import numpy as np
+
+        logits = [-1.8516, 3.0825, -1.2333]
+        engine = self._engine([logits])
+        image = np.full((200, 200, 3), 128, dtype=np.uint8)
+        with self.assertLogs("biometrics.services.face_liveness", level="INFO") as logs:
+            result = engine.assess(image, [40, 40, 160, 160])
+        diagnostic = " ".join(logs.output)
+        self.assertIn("raw_logits=[-1.8516, 3.0825, -1.2333]", diagnostic)
+        self.assertIn("predicted_class=1", diagnostic)
+        self.assertIn("live_index=1", diagnostic)
+        # The live class carries its softmax probability; spoof score is the
+        # strongest non-live class probability.
+        largest = max(logits)
+        exponentials = [2.718281828459045 ** (value - largest) for value in logits]
+        total = sum(exponentials)
+        probabilities = [value / total for value in exponentials]
+        expected_spoof = max(value for index, value in enumerate(probabilities) if index != 1)
+        self.assertAlmostEqual(result.live_score, probabilities[1], places=4)
+        self.assertAlmostEqual(result.spoof_score, expected_spoof, places=4)
+        self.assertIn("live_prob=", diagnostic)
+        self.assertIn("spoof_prob=", diagnostic)
+
+    def test_debug_crop_saved_when_enabled(self):
+        """The exact classifier-input crop is persisted for inspection."""
+        import cv2
+        import numpy as np
+
+        engine = self._engine([[0.1, 6.0, 0.2]])
+        image = np.full((200, 200, 3), 128, dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as media_root:
+            with override_settings(
+                FACE_LIVENESS_INPUT_SIZE=80,
+                FACE_LIVENESS_CROP_SCALE=2.7,
+                FACE_LIVENESS_DEBUG_SAVE_CROP=True,
+                MEDIA_ROOT=media_root,
+            ):
+                result = engine.assess(image, [40, 40, 160, 160])
+            self.assertTrue(result.evaluated)
+            saved = list(Path(media_root, "liveness_debug").glob("liveness_crop_*.jpg"))
+            self.assertEqual(len(saved), 2)
+            full = next(path for path in saved if not path.stem.endswith("80x80"))
+            small = next(path for path in saved if path.stem.endswith("80x80"))
+            self.assertEqual(cv2.imread(str(small)).shape[:2], (80, 80))
+            self.assertIsNotNone(cv2.imread(str(full)))
+
+    def test_debug_crop_not_saved_by_default(self):
+        import numpy as np
+
+        engine = self._engine([[0.1, 6.0, 0.2]])
+        image = np.full((200, 200, 3), 128, dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as media_root:
+            with override_settings(
+                FACE_LIVENESS_INPUT_SIZE=80,
+                FACE_LIVENESS_CROP_SCALE=2.7,
+                MEDIA_ROOT=media_root,
+            ):
+                engine.assess(image, [40, 40, 160, 160])
+            self.assertFalse(Path(media_root, "liveness_debug").exists())
 
     def test_unavailable_model_is_never_reported_as_live(self):
         import numpy as np
@@ -1190,6 +1303,57 @@ class FaceLivenessWorkflowTests(TestCase):
         self.assertFalse(result["liveness_result"])
         self.assertFalse(result["liveness"]["passed"])
         self.assertIsNone(result["liveness"]["anti_spoof_model"])
+
+
+class SummarizeLivenessAggregationTests(TestCase):
+    """Multi-frame aggregation: one bad frame must not reject enrollment."""
+
+    def test_single_bad_frame_does_not_reject_majority_live(self):
+        summary = summarize_liveness(
+            [_live_result(0.95), _live_result(0.92), _spoof_result(0.05)]
+        )
+        self.assertTrue(summary["passed"])
+        self.assertEqual(summary["status"], "LIVE")
+        self.assertEqual(summary["live_votes"], 2)
+        self.assertEqual(summary["spoof_votes"], 1)
+        self.assertGreaterEqual(summary["live_score"], settings.FACE_LIVENESS_THRESHOLD)
+
+    def test_all_spoof_frames_are_rejected(self):
+        summary = summarize_liveness(
+            [_spoof_result(0.05), _spoof_result(0.10), _spoof_result(0.08)]
+        )
+        self.assertFalse(summary["passed"])
+        self.assertEqual(summary["status"], "SPOOF")
+        self.assertEqual(summary["live_votes"], 0)
+
+    def test_majority_spoof_is_rejected_despite_one_live_frame(self):
+        summary = summarize_liveness(
+            [_live_result(0.95), _spoof_result(0.05), _spoof_result(0.05)]
+        )
+        self.assertFalse(summary["passed"])
+        self.assertEqual(summary["status"], "SPOOF")
+        self.assertEqual(summary["live_votes"], 1)
+
+    def test_split_vote_without_spoof_evidence_fails_closed(self):
+        summary = summarize_liveness([_live_result(0.95), _spoof_result(0.05)])
+        self.assertFalse(summary["passed"])
+        self.assertEqual(summary["status"], "SPOOF")
+
+    def test_weak_mean_live_score_does_not_pass(self):
+        # Majority of frames technically LIVE, but the mean live probability
+        # is below the threshold: aggregate evidence is too weak to pass.
+        summary = summarize_liveness(
+            [_live_result(0.65), _live_result(0.55), _spoof_result(0.45)]
+        )
+        self.assertFalse(summary["passed"])
+        self.assertEqual(summary["status"], "SPOOF")
+
+    def test_single_live_frame_still_passes(self):
+        """Authentication uses one capture; the aggregate must not break it."""
+        summary = summarize_liveness([_live_result(0.95)])
+        self.assertTrue(summary["passed"])
+        self.assertEqual(summary["status"], "LIVE")
+        self.assertEqual(summary["live_votes"], 1)
 
 
 class HealthReadinessTests(TestCase):

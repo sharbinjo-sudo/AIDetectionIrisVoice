@@ -14,7 +14,9 @@ is missing the engine reports ``UNAVAILABLE`` and the workflow fails closed.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import lru_cache
+import logging
 import math
 from pathlib import Path
 from threading import Lock
@@ -23,6 +25,8 @@ from django.conf import settings
 
 from .exceptions import BiometricProcessingError, ModelUnavailableError
 from .model_assets import ensure_remote_asset
+
+logger = logging.getLogger(__name__)
 
 LIVENESS_VALID_REASON = "LIVENESS_VALID"
 LIVENESS_SPOOF_REASON = "LIVENESS_SPOOF_DETECTED"
@@ -212,44 +216,78 @@ class FaceLivenessEngine:
                 f"FACE_LIVENESS_MODEL_PATH). Detail: {self._load_error}"
             )
 
+    @staticmethod
+    def _reference_clamped_crop_bounds(
+        image_shape: tuple, bbox_xywh: list[float], scale: float
+    ) -> tuple[int, int, int, int, float]:
+        """Reference (yakhyo/face-anti-spoofing onnx_inference.py) crop bounds.
+
+        The scale is limited so the squared-up face box always fits inside the
+        source image; the resulting box is clamped to the image bounds instead
+        of being reflect-padded. Returns (x1, y1, x2, y2) inclusive-ish ints
+        matching the reference slicing convention ``image[y1:y2+1, x1:x2+1]``.
+        """
+        src_h, src_w = image_shape[:2]
+        x, y, box_w, box_h = bbox_xywh
+        clamped_scale = min(
+            (src_h - 1) / box_h,
+            (src_w - 1) / box_w,
+            scale,
+        )
+        new_w = box_w * clamped_scale
+        new_h = box_h * clamped_scale
+        center_x = x + box_w / 2
+        center_y = y + box_h / 2
+        x1 = max(0, int(center_x - new_w / 2))
+        y1 = max(0, int(center_y - new_h / 2))
+        x2 = min(src_w - 1, int(center_x + new_w / 2))
+        y2 = min(src_h - 1, int(center_y + new_h / 2))
+        return x1, y1, x2, y2, clamped_scale
+
     def _square_face_crop(self, image, bbox):
-        assert self._cv2 is not None
+        """Crop the detected face for MiniFASNet, reference-style.
+
+        Converts [x1,y1,x2,y2] to [x,y,w,h], limits the crop scale so the
+        squared-up box stays inside the source image (never reflect-pads), and
+        returns the clamped crop. Callers resize it to the model input size.
+        """
         height, width = image.shape[:2]
         x0, y0, x1, y1 = [float(value) for value in bbox]
-        center_x = (x0 + x1) * 0.5
-        center_y = (y0 + y1) * 0.5
-        side = max(x1 - x0, y1 - y0) * float(settings.FACE_LIVENESS_CROP_SCALE)
-        half = max(side * 0.5, 1.0)
-
-        left = int(round(center_x - half))
-        top = int(round(center_y - half))
-        right = int(round(center_x + half))
-        bottom = int(round(center_y + half))
-
-        pad_left = max(0, -left)
-        pad_top = max(0, -top)
-        pad_right = max(0, right - width)
-        pad_bottom = max(0, bottom - height)
-
-        left = max(0, left)
-        top = max(0, top)
-        right = min(width, right)
-        bottom = min(height, bottom)
+        bbox_xywh = [x0, y0, x1 - x0, y1 - y0]
+        scale = float(settings.FACE_LIVENESS_CROP_SCALE)
+        if bbox_xywh[2] <= 0 or bbox_xywh[3] <= 0:
+            return None
+        left, top, right, bottom, _used_scale = self._reference_clamped_crop_bounds(
+            image.shape, bbox_xywh, scale
+        )
         if right <= left or bottom <= top:
             return None
-        crop = image[top:bottom, left:right]
+        crop = image[top : bottom + 1, left : right + 1]
         if crop.size == 0:
             return None
-        if pad_left or pad_top or pad_right or pad_bottom:
-            crop = self._cv2.copyMakeBorder(
-                crop,
-                pad_top,
-                pad_bottom,
-                pad_left,
-                pad_right,
-                self._cv2.BORDER_REFLECT_101,
-            )
         return crop
+
+    def _save_debug_crop(self, crop, resized) -> str | None:
+        """Persist the exact classifier input crop for manual inspection.
+
+        Enabled with FACE_LIVENESS_DEBUG_SAVE_CROP=True. Diagnostics only:
+        failures here must never change an assessment outcome.
+        """
+        if not getattr(settings, "FACE_LIVENESS_DEBUG_SAVE_CROP", False):
+            return None
+        try:
+            directory = Path(settings.MEDIA_ROOT) / "liveness_debug"
+            directory.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+            crop_path = directory / f"liveness_crop_{stamp}.jpg"
+            resized_path = directory / f"liveness_crop_{stamp}_80x80.jpg"
+            self._cv2.imwrite(str(crop_path), crop)
+            self._cv2.imwrite(str(resized_path), resized)
+            logger.info("face liveness debug crop saved: %s", crop_path)
+            return str(crop_path)
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            logger.warning("Could not save liveness debug crop: %s", exc)
+            return None
 
     def _probabilities(self, raw: list[float]) -> list[float]:
         activation = str(settings.FACE_LIVENESS_ACTIVATION).strip().lower()
@@ -291,23 +329,43 @@ class FaceLivenessEngine:
                 reason_code=LIVENESS_ERROR_REASON,
                 message="The detected face region could not be cropped for liveness.",
             )
-
         size = int(settings.FACE_LIVENESS_INPUT_SIZE)
+        # Upstream preprocessing: the clamped crop is resized directly to the
+        # model input (80x80). BGR in, raw float32 0-255 pixels, NCHW; swapRB
+        # stays False. No alignment warp.
         resized = self._cv2.resize(crop, (size, size))
+        saved_crop_path = self._save_debug_crop(crop, resized)
+        # Convention decision (NOT chosen because it produces PASS).
+        #
+        # Basis: the A/B/C diagnostic (backend/diag_liveness.py) on a genuine
+        # webcam frame, plus the upstream implementation
+        # (yakhyo/face-anti-spoofing onnx_inference.py), which feeds BGR,
+        # float32 RAW 0-255 pixels, NCHW, a 2.7 crop, and treats class
+        # index 1 as Real.
+        #
+        # The Hugging Face model card
+        # (garciafido/minifasnet-v2-anti-spoofing-onnx) documents /255 with
+        # class 0 = live, but the actual checkpoint behaviour matches the
+        # upstream Silent-Face/MiniFASNet inference convention much more
+        # closely: on the SAME real webcam face and crop, /255 produced
+        # softmax [0.0004, 0.0061, 0.9935] (argmax 2), while raw 0-255
+        # produced [0.0071, 0.9799, 0.0131] (argmax 1), and the byte-exact
+        # upstream-replica pipeline agreed ([0.0112, 0.9413, 0.0475]).
+        # OpenCV images are already BGR, so swapRB must stay False; NCHW
+        # comes from blobFromImage.
         blob = self._cv2.dnn.blobFromImage(
             resized,
-            scalefactor=1.0 / 255.0,
+            scalefactor=1.0,
             size=(size, size),
             mean=(0.0, 0.0, 0.0),
-            swapRB=True,
+            swapRB=False,
         )
         try:
             with self._lock:
                 self._net.setInput(blob)
                 output = self._np.asarray(self._net.forward()).reshape(-1)
-            probabilities = self._probabilities(
-                [float(value) for value in output.tolist()]
-            )
+            raw_values = [float(value) for value in output.tolist()]
+            probabilities = self._probabilities(raw_values)
         except Exception as exc:
             return LivenessResult(
                 evaluated=False,
@@ -328,6 +386,7 @@ class FaceLivenessEngine:
 
         live_index = min(max(int(settings.FACE_LIVENESS_LIVE_INDEX), 0), len(probabilities) - 1)
         live_score = float(probabilities[live_index])
+        predicted_class = max(range(len(probabilities)), key=lambda index: probabilities[index])
         spoof_score = float(
             max(
                 (value for index, value in enumerate(probabilities) if index != live_index),
@@ -335,6 +394,29 @@ class FaceLivenessEngine:
             )
             if len(probabilities) > 1
             else 1.0 - live_score
+        )
+
+        # Score diagnostics on every assessment: raw logits, softmax,
+        # predicted class, live and spoof probability. Kept at INFO so
+        # production captures can be audited against the A/B/C diagnostic
+        # evidence that fixed the preprocessing/class conventions.
+        logger.info(
+            "face liveness diagnostic: crop=%dx%d resized=%dx%d input_minmax=%.4f/%.4f "
+            "raw_logits=%s softmax=%s predicted_class=%d live_index=%d "
+            "live_prob=%.4f spoof_prob=%.4f debug_crop=%s",
+            crop.shape[1],
+            crop.shape[0],
+            size,
+            size,
+            float(resized.min()),
+            float(resized.max()),
+            [round(value, 4) for value in raw_values],
+            [round(value, 4) for value in probabilities],
+            predicted_class,
+            live_index,
+            live_score,
+            spoof_score,
+            saved_crop_path,
         )
         threshold = float(settings.FACE_LIVENESS_THRESHOLD)
         passed = live_score >= threshold
@@ -362,7 +444,26 @@ def get_face_liveness_engine() -> FaceLivenessEngine:
 
 
 def summarize_liveness(results: list[LivenessResult]) -> dict:
-    """Aggregate per-frame liveness outcomes for API reporting."""
+    """Aggregate per-frame liveness outcomes for API reporting.
+
+    Enrollment captures several frames, and a single noisy frame (motion
+    blur, a half-blink, partial occlusion) must not reject an otherwise live
+    capture. The aggregate verdict combines three signals over the evaluated
+    frames:
+
+    1. mean live probability across frames,
+    2. a majority of frames classified LIVE at the configured threshold,
+    3. aggregate spoof evidence (mean spoof score) at the same threshold.
+
+    Verdict rules:
+    - SPOOF when a majority of frames are spoof or mean spoof evidence is
+      itself above the threshold (overwhelming spoof evidence).
+    - LIVE only when the mean live score passes, a majority (not merely
+      some) of frames are LIVE, and aggregate spoof evidence stays below
+      the threshold.
+    - An evenly split vote without spoof evidence is treated as ambiguous
+      and rejected: an ambiguous capture must not pass.
+    """
     if not results:
         return not_evaluated_result(
             LIVENESS_NOT_EVALUATED_REASON,
@@ -377,9 +478,26 @@ def summarize_liveness(results: list[LivenessResult]) -> dict:
             "samples_checked": len(results),
         }
 
-    passed = all(result.passed for result in evaluated)
-    mean_live = sum(result.live_score for result in evaluated) / len(evaluated)
-    mean_spoof = sum(result.spoof_score for result in evaluated) / len(evaluated)
+    total = len(evaluated)
+    live_votes = sum(1 for result in evaluated if result.passed)
+    spoof_votes = total - live_votes
+    mean_live = sum(result.live_score for result in evaluated) / total
+    mean_spoof = sum(result.spoof_score for result in evaluated) / total
+    majority = total // 2 + 1
+    threshold = evaluated[0].threshold
+
+    majority_live = live_votes >= majority
+    majority_spoof = spoof_votes >= majority
+    spoof_evidence = mean_spoof >= threshold
+
+    if majority_spoof or spoof_evidence:
+        # Aggregate evidence indicates a presentation attack; a handful of
+        # borderline frames must not mask it.
+        passed = False
+    else:
+        # Majority LIVE + passing mean live score => live.
+        passed = majority_live and mean_live >= threshold
+
     model = evaluated[0].model
     status = "LIVE" if passed else "SPOOF"
     return {
@@ -394,10 +512,14 @@ def summarize_liveness(results: list[LivenessResult]) -> dict:
             LIVENESS_VALID_REASON if passed else LIVENESS_SPOOF_REASON
         ),
         "message": (
-            "Liveness check passed: all captured frames appear to be a live person."
+            "Liveness check passed: the captured frames collectively appear to "
+            "be a live person."
             if passed
-            else "Liveness check failed: at least one frame appears to be a presentation attack."
+            else "Liveness check failed: the captured frames collectively appear "
+            "to be a presentation attack."
         ),
         "samples_checked": len(results),
         "samples_evaluated": len(evaluated),
+        "live_votes": live_votes,
+        "spoof_votes": spoof_votes,
     }

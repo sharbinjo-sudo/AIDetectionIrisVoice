@@ -272,9 +272,22 @@ FACE_LIVENESS_MODEL_NAME = _env("FACE_LIVENESS_MODEL_NAME", "MiniFASNet face ant
 FACE_LIVENESS_MODEL_URL = _env("FACE_LIVENESS_MODEL_URL", "")
 FACE_LIVENESS_INPUT_SIZE = int(_env("FACE_LIVENESS_INPUT_SIZE", "80"))
 FACE_LIVENESS_CROP_SCALE = _env_float("FACE_LIVENESS_CROP_SCALE", 2.7)
-# Index of the "live" class in the classifier output. MiniFASNetV2 emits three
-# logits ordered [print, live, replay] but variants differ, so it is configurable.
+# Index of the "live" class in the classifier output. Decision basis: the
+# A/B/C diagnostic (backend/diag_liveness.py) on a genuine webcam frame plus
+# the upstream implementation (yakhyo/face-anti-spoofing onnx_inference.py),
+# which feeds BGR, float32 RAW 0-255 pixels, NCHW, a 2.7 crop, and treats
+# class index 1 as Real. The Hugging Face model card
+# (garciafido/minifasnet-v2-anti-spoofing-onnx) documents /255 with class 0 =
+# live, but the checkpoint's actual behaviour matches the upstream
+# Silent-Face/MiniFASNet convention: on the SAME real face and crop, /255
+# produced softmax [0.0004, 0.0061, 0.9935] (argmax 2) while raw 0-255
+# produced [0.0071, 0.9799, 0.0131] (argmax 1), and the byte-exact
+# upstream-replica pipeline agreed. This convention was NOT chosen because
+# it produces PASS; it matches the checkpoint's observed behaviour.
 FACE_LIVENESS_LIVE_INDEX = int(_env("FACE_LIVENESS_LIVE_INDEX", "1"))
+# When True, the exact face crop fed to the liveness classifier is saved
+# under MEDIA_ROOT/liveness_debug/ for manual inspection. Diagnostics only.
+FACE_LIVENESS_DEBUG_SAVE_CROP = _env_bool("FACE_LIVENESS_DEBUG_SAVE_CROP", False)
 FACE_LIVENESS_ACTIVATION = _env("FACE_LIVENESS_ACTIVATION", "softmax")
 FACE_LIVENESS_THRESHOLD = _env_float("FACE_LIVENESS_THRESHOLD", 0.60)
 # When True, registration and login require an affirmative liveness result; a
