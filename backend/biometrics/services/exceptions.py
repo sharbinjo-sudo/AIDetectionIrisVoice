@@ -10,6 +10,12 @@ class BiometricProcessingError(BiometricServiceError):
     status_code = 422
 
 
+class SpoofDetectedError(BiometricServiceError):
+    """A dedicated anti-spoofing model reported a presentation attack."""
+
+    status_code = 403
+
+
 class ModelUnavailableError(BiometricServiceError):
     status_code = 503
 

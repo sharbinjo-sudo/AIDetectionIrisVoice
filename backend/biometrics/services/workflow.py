@@ -13,12 +13,16 @@ from biometrics.models import Decision
 
 from .engines import get_iris_engine, get_voice_engine
 from .face_engine import get_face_engine
+from .face_liveness import not_evaluated_result, summarize_liveness
 from .exceptions import (
     BiometricServiceError,
     BiometricValidationError,
     EnrollmentIncompleteError,
+    ModelUnavailableError,
+    SpoofDetectedError,
 )
 from .fusion import (
+    FusionDecision,
     FusionInputs,
     ModalityMeasurement,
     REASON_MESSAGES,
@@ -31,6 +35,26 @@ from .fusion import (
 from .template_crypto import decrypt_template, encrypt_template
 
 logger = logging.getLogger(__name__)
+
+
+def _liveness_evidence(face_samples: list) -> tuple[dict, str]:
+    """Aggregate dedicated anti-spoofing results across captured face frames.
+
+    Returns ``(summary, status)`` where status is one of ``none`` (no single
+    face frame), ``unavailable`` (the anti-spoofing model could not run),
+    ``spoof`` (a presentation attack was detected), or ``ok`` (live).
+    Detection confidence is never used here.
+    """
+    detected = [sample for sample in face_samples if sample.face_count == 1]
+    if not detected:
+        return not_evaluated_result().as_dict(), "none"
+    results = [sample.liveness for sample in detected if sample.liveness is not None]
+    summary = (
+        summarize_liveness(results) if results else not_evaluated_result().as_dict()
+    )
+    if not summary.get("evaluated"):
+        return {**summary, "status": "UNAVAILABLE"}, "unavailable"
+    return summary, "ok" if summary.get("passed") else "spoof"
 
 
 def resolve_user(identifier: str) -> BiometricUser:
@@ -53,6 +77,7 @@ def get_service_health() -> dict:
     thresholds = get_calibrated_thresholds()
     return {
         "face_model": face,
+        "face_liveness_model": face.get("liveness_model"),
         "voice_model": voice,
         "iris_model": iris,
         "offline_mode": settings.BIOMETRIC_OFFLINE_MODE,
@@ -202,6 +227,23 @@ def enroll_user_biometrics(
     """
     face_engine = get_face_engine()
     face_samples = [face_engine.extract_features(path) for path in face_paths]
+    # Registration requires a dedicated liveness result for every captured
+    # frame that produced exactly one face. A missing anti-spoofing model
+    # fails closed rather than enrolling on detection confidence alone.
+    liveness_summary, liveness_status = _liveness_evidence(face_samples)
+    # A positive spoof detection is always honored, even in development.
+    if liveness_status == "spoof":
+        raise SpoofDetectedError(
+            "Liveness check failed during enrollment: a presentation attack "
+            "(photo, screen, or mask) was detected. Only a live person may enroll."
+        )
+    # Only a *missing* anti-spoofing model is downgraded outside production;
+    # production requires an affirmative liveness result and fails closed.
+    if settings.FACE_LIVENESS_REQUIRED and liveness_status == "unavailable":
+        raise ModelUnavailableError(
+            "The dedicated face anti-spoofing model is unavailable, so face "
+            "enrollment could not complete. Provision the liveness model and retry."
+        )
     # In the low-quality-camera prototype the same full frames are retained
     # under the iris upload field for UI/API compatibility, but iris
     # segmentation is not a gate and no iris template is created.
@@ -215,7 +257,12 @@ def enroll_user_biometrics(
     voice_samples = [voice_engine.extract_features(path) for path in voice_paths]
 
     problems: list[str] = []
-    valid_faces = [sample for sample in face_samples if sample.valid_measurement]
+    valid_faces = [
+        sample
+        for sample in face_samples
+        if sample.valid_measurement
+        and (not settings.FACE_LIVENESS_REQUIRED or sample.liveness_passed)
+    ]
     valid_irises = [
         sample
         for sample in iris_samples
@@ -324,6 +371,11 @@ def enroll_user_biometrics(
         "user_id": str(user.id),
         "eye_side": eye_side,
         "face_quality": user.face_quality_score,
+        "face_similarity": None,
+        "liveness": liveness_summary,
+        "liveness_result": liveness_summary.get("passed"),
+        "verification_status": "ENROLLED",
+        "failure_reason": None,
         "face_samples": len(valid_faces),
         "iris_quality": user.iris_quality_score,
         "iris_samples": (
@@ -387,6 +439,13 @@ def authenticate_enrolled_user(
     auth_face_samples = max(1, settings.AUTH_FACE_SAMPLES)
     auth_iris_samples = max(1, settings.AUTH_IRIS_SAMPLES)
     face_samples = [face_engine.extract_features(path) for path in face_paths]
+    # Dedicated anti-spoofing evidence for this live login capture. Detection
+    # confidence is never substituted for it; when it is required and missing
+    # the authentication fails closed below.
+    liveness_summary, liveness_status = _liveness_evidence(face_samples)
+    liveness_required = settings.FACE_LIVENESS_REQUIRED
+    liveness_spoof = liveness_status == "spoof"
+    liveness_unavailable = liveness_required and liveness_status == "unavailable"
     iris_engine = None if settings.FACE_PRIMARY_CAPTURE_MODE else get_iris_engine()
     iris_samples = (
         [iris_engine.extract_features(path, eye_side=eye_side) for path in iris_paths]
@@ -473,7 +532,24 @@ def authenticate_enrolled_user(
         valid_measurement=voice_valid,
         speech_activity=speech_activity,
     )
-    if settings.FACE_PRIMARY_CAPTURE_MODE:
+    if liveness_unavailable:
+        # Fail closed: without confirmed liveness the face cannot be accepted,
+        # and the failure is infrastructural, not a quality or identity result.
+        decision = FusionDecision(
+            decision=Decision.PROCESSING_ERROR,
+            reason_code=ReasonCode.PROCESSING_ERROR,
+            message=(
+                "The dedicated face anti-spoofing model is unavailable, so "
+                "liveness could not be evaluated and verification did not complete."
+            ),
+            fusion_score=0.0,
+            fusion_threshold=thresholds["fusion_threshold"],
+            iris_weight=0.0,
+            voice_weight=0.0,
+            face_weight=0.0,
+            policy={"liveness": liveness_summary},
+        )
+    elif settings.FACE_PRIMARY_CAPTURE_MODE:
         decision = fuse_face_voice(
             face=face_measurement,
             voice=voice_measurement,
@@ -485,6 +561,7 @@ def authenticate_enrolled_user(
             voice_activity_threshold=settings.VOICE_ACTIVITY_THRESHOLD,
             face_similarity_threshold=settings.FACE_SIMILARITY_THRESHOLD,
             voice_similarity_threshold=settings.VOICE_SIMILARITY_THRESHOLD,
+            spoof_evidence=liveness_spoof,
         )
     else:
         decision = fuse_three_modalities(
@@ -503,12 +580,21 @@ def authenticate_enrolled_user(
             face_similarity_threshold=settings.FACE_SIMILARITY_THRESHOLD,
             iris_similarity_threshold=settings.IRIS_SIMILARITY_THRESHOLD,
             voice_similarity_threshold=settings.VOICE_SIMILARITY_THRESHOLD,
+            spoof_evidence=liveness_spoof,
         )
     decision_enum = Decision(decision.decision)
     accepted = decision_enum == Decision.ACCEPTED
+    ui_state = _ui_state_for(decision_enum, decision.reason_code)
     diagnostics = {
         "score_kind": "normalized_template_cosine_similarity_not_calibrated_probability",
         "face_similarity": round(face_score, 4),
+        "liveness_status": liveness_summary.get("status"),
+        "liveness_passed": liveness_summary.get("passed"),
+        "liveness_evaluated": liveness_summary.get("evaluated"),
+        "liveness_score": liveness_summary.get("live_score"),
+        "liveness_threshold": liveness_summary.get("threshold"),
+        "anti_spoof_model": liveness_summary.get("anti_spoof_model"),
+        "liveness_required": liveness_required,
         "face_quality": round(face_quality, 4),
         "face_detection_confidence": round(face_detection_confidence, 4),
         "face_valid_measurement": face_measurement.valid_measurement,
@@ -567,15 +653,14 @@ def authenticate_enrolled_user(
         "decision": decision_enum,
         "reason_code": decision.reason_code,
         "reason_message": decision.message,
-        "ui_state": _ui_state_for(decision_enum, decision.reason_code),
+        "ui_state": ui_state,
+        "verification_status": ui_state,
+        "face_similarity": round(face_score, 4),
+        "liveness": liveness_summary,
+        "liveness_result": liveness_summary.get("passed"),
         "failure_reason": None if accepted else decision.message,
         "processing_time_ms": int((perf_counter() - started) * 1000),
         "privacy_mode": True,
-        "liveness": {
-            "status": "NOT_EVALUATED",
-            "anti_spoof_model": None,
-            "speech_activity_checked": True,
-        },
         "diagnostics": diagnostics,
     }
 

@@ -9,6 +9,11 @@ from threading import Lock
 from django.conf import settings
 
 from .exceptions import BiometricProcessingError, ModelUnavailableError
+from .face_liveness import (
+    LivenessResult,
+    error_result,
+    get_face_liveness_engine,
+)
 
 
 def _clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
@@ -43,6 +48,17 @@ class FaceSample:
     valid_measurement: bool
     reason_code: str
     message: str
+    # Dedicated anti-spoofing result. Kept separate from detection confidence
+    # so a detector score is never presented as liveness evidence.
+    liveness: LivenessResult | None = None
+
+    @property
+    def liveness_evaluated(self) -> bool:
+        return bool(self.liveness and self.liveness.evaluated)
+
+    @property
+    def liveness_passed(self) -> bool:
+        return bool(self.liveness and self.liveness.evaluated and self.liveness.passed)
 
 
 class FaceBiometricEngine:
@@ -105,12 +121,15 @@ class FaceBiometricEngine:
         )
 
     def health(self) -> dict:
+        liveness = get_face_liveness_engine().health()
         return {
             "ready": self.ready,
             "name": self.name,
             "mode": "local_buffalo_l" if self.ready else "unavailable",
             "source": str(self._model_dir),
             "detail": None if self.ready else str(self._load_error),
+            "liveness_model": liveness,
+            "liveness_ready": liveness["ready"],
         }
 
     def _ensure_ready(self) -> None:
@@ -305,9 +324,19 @@ class FaceBiometricEngine:
             raise BiometricProcessingError("The uploaded face image could not be read.")
         faces = self._detect_faces(image)
         if not faces:
-            return FaceSample([], 0.0, 0.0, 0, False, "FACE_NOT_DETECTED", "No face was detected.")
+            return FaceSample(
+                [], 0.0, 0.0, 0, False, "FACE_NOT_DETECTED", "No face was detected."
+            )
         if len(faces) != 1:
-            return FaceSample([], 0.0, 0.0, len(faces), False, "MULTIPLE_FACES", "More than one face was detected.")
+            return FaceSample(
+                [],
+                0.0,
+                0.0,
+                len(faces),
+                False,
+                "MULTIPLE_FACES",
+                "More than one face was detected.",
+            )
 
         face = faces[0]
         height, width = image.shape[:2]
@@ -316,7 +345,20 @@ class FaceBiometricEngine:
         x1i, y1i = min(int(x1), width), min(int(y1), height)
         crop = image[y0i:y1i, x0i:x1i]
         if crop.size == 0:
-            return FaceSample([], 0.0, float(face["score"]), 1, False, "FACE_NOT_DETECTED", "The detected face crop was empty.")
+            return FaceSample(
+                [],
+                0.0,
+                float(face["score"]),
+                1,
+                False,
+                "FACE_NOT_DETECTED",
+                "The detected face crop was empty.",
+            )
+
+        # Exactly one face was detected; run the dedicated anti-spoofing model
+        # before the ArcFace embedding is generated. SCRFD confidence is not
+        # used as liveness evidence anywhere in this pipeline.
+        liveness = self._assess_liveness(image, face["bbox"])
 
         gray = self._cv2.cvtColor(crop, self._cv2.COLOR_BGR2GRAY)
         sharpness = float(self._cv2.Laplacian(gray, self._cv2.CV_64F).var())
@@ -371,7 +413,25 @@ class FaceBiometricEngine:
             valid_measurement=valid,
             reason_code=reason,
             message=message,
+            liveness=liveness,
         )
+
+    def _assess_liveness(self, image, bbox) -> LivenessResult:
+        """Evaluate the dedicated anti-spoofing classifier on a face crop.
+
+        The engine itself reports an ``UNAVAILABLE`` result when its model is
+        missing, so callers always see an explicit status rather than an
+        implicit pass. Detection confidence is never used as a substitute.
+        """
+        engine = get_face_liveness_engine()
+        try:
+            return engine.assess(image, bbox)
+        except BiometricProcessingError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive
+            return error_result(
+                f"The face anti-spoofing classifier could not run: {exc}"
+            )
 
     def aggregate(
         self,

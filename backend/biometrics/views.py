@@ -79,6 +79,13 @@ class HealthView(APIView):
             database_ready = False
 
         health = get_service_health()
+        liveness = health.get("face_liveness_model") or {}
+        liveness_ready = bool(liveness.get("ready"))
+        liveness_required = bool(liveness.get("required", True))
+        # Global readiness reflects the API, database, and the three deployed
+        # identity models. A not-yet-provisioned anti-spoofing asset must not
+        # make the whole service look like it is still starting; it is reported
+        # separately as face_verification_ready below.
         service_ready = (
             database_ready
             and health["voice_model"].get("ready") is True
@@ -95,6 +102,10 @@ class HealthView(APIView):
             "voice_model": health["voice_model"],
             "iris_model": health["iris_model"],
             "face_model": health["face_model"],
+            "face_liveness_model": health.get("face_liveness_model"),
+            "face_liveness_ready": liveness_ready,
+            "face_liveness_required": liveness_required,
+            "face_verification_ready": liveness_ready or not liveness_required,
             "offline_mode": health["offline_mode"],
             "development_thresholds": health["development_thresholds"],
             "fusion_calibration_ready": health["fusion_calibration_ready"],
@@ -138,6 +149,9 @@ class SystemConfigurationView(APIView):
                 "minimum_voice_segments": settings.MIN_VOICE_SEGMENTS,
                 "minimum_iris_samples": settings.MIN_IRIS_SAMPLES,
                 "face_model": health["face_model"],
+                "face_liveness_model": health.get("face_liveness_model"),
+                "face_liveness_required": settings.FACE_LIVENESS_REQUIRED,
+                "face_liveness_threshold": settings.FACE_LIVENESS_THRESHOLD,
                 "voice_model": health["voice_model"],
                 "iris_model": health["iris_model"],
             }
@@ -382,6 +396,9 @@ class BiometricAuthenticateView(APIView):
                     "speech_activity": diagnostics.get("speech_activity"),
                     "iris_policy": diagnostics.get("iris_policy", "verified"),
                     "threshold_source": diagnostics.get("threshold_source"),
+                    "verification_status": result.get("verification_status"),
+                    "face_similarity": result.get("face_similarity"),
+                    "liveness": result.get("liveness"),
                 },
             )
         except Exception:

@@ -54,6 +54,27 @@ verified with SHA-256 `5838f7fe...b85b5b91` (detector) and
 `4c06341c...fc619e43` (recognition). Review the linked InsightFace model
 license before commercial deployment.
 
+Face verification additionally requires a **dedicated** anti-spoofing /
+liveness classifier, which is intentionally separate from SCRFD. Drop a
+MiniFASNet-compatible ONNX model at one of these paths:
+
+```text
+backend/trained_models/face/antispoof/minifasnet_v2.onnx
+backend/trained_models/face/antispoof/antispoof.onnx
+backend/trained_models/face/antispoof/liveness.onnx
+```
+
+Or set `FACE_LIVENESS_MODEL_PATH` / `FACE_LIVENESS_MODEL_DIR` in `.env`. The
+live class index, input size, crop scale, activation, and threshold are
+configurable (`FACE_LIVENESS_LIVE_INDEX`, `FACE_LIVENESS_INPUT_SIZE`,
+`FACE_LIVENESS_CROP_SCALE`, `FACE_LIVENESS_ACTIVATION`,
+`FACE_LIVENESS_THRESHOLD`). Detection confidence is never used as liveness
+evidence. A positive spoof detection is always rejected. When the model is
+missing, production fails closed (`FACE_LIVENESS_REQUIRED=True`, enforced at
+startup when `DEBUG=False`); a development run (`DEBUG=True`) keeps the
+face/iris/voice pipeline usable and reports liveness as `UNAVAILABLE` rather
+than fabricating a pass.
+
 Runtime is offline-first by default (`BIOMETRIC_OFFLINE_MODE=true`). The app
 does not download models while authenticating. The local Worldcoin ONNX model,
 SpeechBrain files, buffalo_l files, and cached `backend/.model_cache/iris/face_landmarker.task`
@@ -175,7 +196,10 @@ it, the release APK is debug-signed and is suitable only for local testing.
 - Registration stores Fernet-encrypted, aggregated templates, not uploaded camera/audio files. Set an independent `BIOMETRIC_TEMPLATE_KEYS` value in production and retain old keys during key rotation.
 - Login capture quality failures request a retry; a usable template mismatch is reported separately.
 - Face and iris verification aggregate at least three frames. Voice verification aggregates at least two non-overlapping ECAPA segments.
-- Identity matching is not described as liveness. The response reports dedicated anti-spoofing as `NOT_EVALUATED` until such a model is explicitly added.
+- Registration detects exactly one face, runs the dedicated anti-spoofing model, generates an ArcFace embedding, stores only the encrypted face template, and the temporary image is deleted after processing.
+- Login repeats detection, liveness, and ArcFace embedding, then compares against the enrolled template with cosine similarity. The response reports `face_similarity`, a `liveness` block, the `verification_status`/`ui_state`, and a `failure_reason`.
+- Face liveness comes only from the dedicated anti-spoofing classifier: SCRFD detection confidence is never reported as liveness, and a detected spoof is always rejected. In production the missing-model path fails closed; development reports `UNAVAILABLE` honestly instead of skipping the check silently.
+- `/api/v1/health/` reports `face_liveness_model`, `face_liveness_ready`, and `face_verification_ready` separately. A pending anti-spoofing asset does not downgrade the overall service status, so the client does not show "Backend Starting" solely because liveness is not provisioned yet.
 
 ## Local run order
 

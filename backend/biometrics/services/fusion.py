@@ -586,14 +586,28 @@ def fuse_face_voice(
     voice_activity_threshold: float,
     face_similarity_threshold: float,
     voice_similarity_threshold: float,
+    spoof_evidence: bool = False,
 ) -> FusionDecision:
     """Fuse real face and voice identity measurements for prototype mode.
 
     Iris is deliberately absent from this policy; the camera frame can still
     be labelled and transported as an iris sample, but it contributes no
     identity evidence. This keeps the low-quality-camera submission path
-    explicit instead of manufacturing an iris score.
+    explicit instead of manufacturing an iris score. A dedicated anti-spoofing
+    model may supply ``spoof_evidence`` to force a spoof rejection.
     """
+    if spoof_evidence:
+        return FusionDecision(
+            decision="REJECTED_SPOOF",
+            reason_code=ReasonCode.REJECTED_SPOOF,
+            message=REASON_MESSAGES[ReasonCode.REJECTED_SPOOF],
+            fusion_score=0.0,
+            fusion_threshold=fusion_threshold,
+            face_weight=0.0,
+            iris_weight=0.0,
+            voice_weight=0.0,
+            policy={"spoof_evidence": True, "iris_policy": "capture_only"},
+        )
     face.valid_measurement = bool(face.valid_measurement) and quality_gate_open(
         face.quality,
         face.detection_confidence,

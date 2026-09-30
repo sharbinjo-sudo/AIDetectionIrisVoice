@@ -24,7 +24,9 @@ from .models import (
 )
 from .services.engines import IrisBiometricEngine, VoiceBiometricEngine
 from .services.engines import IrisSample, VoiceSample
+from .services.exceptions import ModelUnavailableError, SpoofDetectedError
 from .services.face_engine import FaceSample
+from .services.face_liveness import FaceLivenessEngine, LivenessResult
 from .services.fusion import (
     FusionInputs,
     ModalityMeasurement,
@@ -40,6 +42,48 @@ from .services.workflow import (
     authenticate_human,
     enroll_user_biometrics,
 )
+
+
+def _live_result(score: float = 0.95) -> LivenessResult:
+    """Build a passed dedicated anti-spoofing result for mocked face frames."""
+    return LivenessResult(
+        evaluated=True,
+        passed=True,
+        live_score=score,
+        spoof_score=1.0 - score,
+        threshold=settings.FACE_LIVENESS_THRESHOLD,
+        model="test-antispoof",
+        status="LIVE",
+        reason_code="LIVENESS_VALID",
+        message="liveness ok",
+    )
+
+
+def _spoof_result(score: float = 0.05) -> LivenessResult:
+    """Build a failed dedicated anti-spoofing result for mocked face frames."""
+    return LivenessResult(
+        evaluated=True,
+        passed=False,
+        live_score=score,
+        spoof_score=1.0 - score,
+        threshold=settings.FACE_LIVENESS_THRESHOLD,
+        model="test-antispoof",
+        status="SPOOF",
+        reason_code="LIVENESS_SPOOF_DETECTED",
+        message="presentation attack detected",
+    )
+
+
+class _FakeLivenessNet:
+    def __init__(self, output):
+        self.output = output
+        self.input = None
+
+    def setInput(self, value):
+        self.input = value
+
+    def forward(self):
+        return self.output
 
 
 class _FakeIrisNet:
@@ -585,6 +629,7 @@ class EnrolledBiometricWorkflowTests(TestCase):
             valid_measurement=True,
             reason_code="FACE_VALID",
             message="ok",
+            liveness=_live_result(),
         )
         face_engine.return_value.aggregate.return_value = [0.2, 0.4, 0.6]
         iris_engine.return_value.extract_features.return_value = IrisSample(
@@ -646,6 +691,7 @@ class EnrolledBiometricWorkflowTests(TestCase):
             valid_measurement=True,
             reason_code="FACE_VALID",
             message="ok",
+            liveness=_live_result(),
         )
         face_engine.return_value.aggregate.return_value = [0.2, 0.4, 0.6]
         voice_engine.return_value.extract_features.return_value = VoiceSample(
@@ -703,7 +749,8 @@ class EnrolledBiometricWorkflowTests(TestCase):
             "calibrated": False,
         }
         face_engine.return_value.extract_features.return_value = FaceSample(
-            [0.2, 0.4, 0.6], 0.9, 0.95, 1, True, "FACE_VALID", "ok"
+            [0.2, 0.4, 0.6], 0.9, 0.95, 1, True, "FACE_VALID", "ok",
+            liveness=_live_result(),
         )
         face_engine.return_value.compare_samples.return_value = {
             "face": {
@@ -740,6 +787,14 @@ class EnrolledBiometricWorkflowTests(TestCase):
         self.assertEqual(result["fusion"]["iris_weight"], 0.0)
         self.assertGreater(result["fusion"]["face_weight"], 0.0)
         self.assertGreater(result["fusion"]["voice_weight"], 0.0)
+        # Dedicated liveness, face similarity, status and failure reason are
+        # all reported explicitly on a successful login.
+        self.assertEqual(result["face_similarity"], 0.92)
+        self.assertEqual(result["verification_status"], "VERIFIED")
+        self.assertTrue(result["liveness_result"])
+        self.assertEqual(result["liveness"]["status"], "LIVE")
+        self.assertEqual(result["liveness"]["anti_spoof_model"], "test-antispoof")
+        self.assertIsNone(result["failure_reason"])
         face_engine.return_value.compare_samples.assert_called_once()
         self.assertEqual(
             len(face_engine.return_value.compare_samples.call_args.args[0]), 1
@@ -767,7 +822,8 @@ class EnrolledBiometricWorkflowTests(TestCase):
             {"vector": [0.1]},
         ]
         face_engine.return_value.extract_features.return_value = FaceSample(
-            [0.1], 0.9, 0.9, 1, True, "FACE_VALID", "ok"
+            [0.1], 0.9, 0.9, 1, True, "FACE_VALID", "ok",
+            liveness=_live_result(),
         )
         iris_engine.return_value.extract_features.return_value = IrisSample(
             True, 0.9, [0.1], 0.9
@@ -818,6 +874,350 @@ class EnrolledBiometricWorkflowTests(TestCase):
 
         self.assertEqual(result["decision"], Decision.REJECTED_MISMATCH)
         self.assertEqual(result["ui_state"], "REJECTED_MISMATCH")
+
+
+class FaceLivenessEngineTests(TestCase):
+    """The anti-spoofing model is a separate classifier, not SCRFD confidence."""
+
+    def _engine(self, output):
+        import cv2
+        import numpy as np
+
+        engine = FaceLivenessEngine.__new__(FaceLivenessEngine)
+        engine._cv2 = cv2
+        engine._np = np
+        engine._net = _FakeLivenessNet(np.asarray(output, dtype=np.float32))
+        engine._model_name = "test-antispoof"
+        engine._model_path = "test-antispoof.onnx"
+        engine._load_error = None
+        engine._lock = Lock()
+        return engine
+
+    @override_settings(
+        FACE_LIVENESS_ACTIVATION="softmax",
+        FACE_LIVENESS_LIVE_INDEX=1,
+        FACE_LIVENESS_THRESHOLD=0.60,
+    )
+    def test_live_face_passes_with_dedicated_model(self):
+        import numpy as np
+
+        engine = self._engine([[0.1, 6.0, 0.2]])
+        image = np.full((200, 200, 3), 128, dtype=np.uint8)
+        result = engine.assess(image, [40, 40, 160, 160])
+        self.assertTrue(result.evaluated)
+        self.assertTrue(result.passed)
+        self.assertEqual(result.status, "LIVE")
+        self.assertGreater(result.live_score, 0.9)
+        self.assertEqual(result.model, "test-antispoof")
+
+    @override_settings(
+        FACE_LIVENESS_ACTIVATION="softmax",
+        FACE_LIVENESS_LIVE_INDEX=1,
+        FACE_LIVENESS_THRESHOLD=0.60,
+    )
+    def test_spoof_face_is_rejected(self):
+        import numpy as np
+
+        engine = self._engine([[6.0, 0.1, 0.2]])
+        image = np.full((200, 200, 3), 128, dtype=np.uint8)
+        result = engine.assess(image, [40, 40, 160, 160])
+        self.assertTrue(result.evaluated)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.status, "SPOOF")
+
+    def test_unavailable_model_is_never_reported_as_live(self):
+        import numpy as np
+
+        engine = FaceLivenessEngine.__new__(FaceLivenessEngine)
+        engine._cv2 = None
+        engine._np = None
+        engine._net = None
+        engine._model_name = "test-antispoof"
+        engine._model_path = None
+        engine._load_error = FileNotFoundError("missing model")
+        engine._lock = Lock()
+
+        self.assertFalse(engine.ready)
+        result = engine.assess(np.zeros((10, 10, 3), dtype=np.uint8), [1, 1, 5, 5])
+        self.assertFalse(result.evaluated)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.status, "UNAVAILABLE")
+        self.assertEqual(result.reason_code, "LIVENESS_MODEL_UNAVAILABLE")
+
+
+class FaceLivenessWorkflowTests(TestCase):
+    """Registration and login must gate on the dedicated liveness model."""
+
+    def setUp(self):
+        self.user = BiometricUser.objects.create(
+            external_id="LIVE-001",
+            full_name="Liveness User",
+        )
+
+    def _enroll_prototype(self):
+        self.user.enrollment_status = EnrollmentStatus.COMPLETE
+        self.user.face_template_encrypted = "encrypted-face"
+        self.user.iris_template_encrypted = ""
+        self.user.voice_template_encrypted = "encrypted-voice"
+        self.user.save()
+
+    def _thresholds(self):
+        return {
+            "fusion_threshold": 0.80,
+            "single_modality_fallback_threshold": 0.9,
+            "source": "test",
+            "calibrated": False,
+        }
+
+    @override_settings(FACE_PRIMARY_CAPTURE_MODE=True, FACE_LIVENESS_REQUIRED=True)
+    @patch("biometrics.services.workflow.get_face_engine")
+    @patch("biometrics.services.workflow.get_voice_engine")
+    @patch("biometrics.services.workflow.get_iris_engine")
+    def test_enrollment_fails_closed_when_liveness_model_unavailable(
+        self, iris_engine, voice_engine, face_engine
+    ):
+        # No liveness result attached: the anti-spoofing stage cannot run.
+        face_engine.return_value.extract_features.return_value = FaceSample(
+            [0.2, 0.4, 0.6], 0.88, 0.95, 1, True, "FACE_VALID", "ok"
+        )
+        with self.assertRaises(ModelUnavailableError):
+            enroll_user_biometrics(
+                user=self.user,
+                face_paths=["camera_1.jpg"],
+                iris_paths=["camera_1.jpg"],
+                voice_paths=["voice_1.wav"],
+                eye_side="LEFT",
+            )
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.face_template_encrypted)
+
+    @override_settings(FACE_PRIMARY_CAPTURE_MODE=True)
+    @patch("biometrics.services.workflow.get_face_engine")
+    @patch("biometrics.services.workflow.get_voice_engine")
+    @patch("biometrics.services.workflow.get_iris_engine")
+    def test_enrollment_rejects_spoofed_face(
+        self, iris_engine, voice_engine, face_engine
+    ):
+        face_engine.return_value.extract_features.return_value = FaceSample(
+            [0.2, 0.4, 0.6], 0.88, 0.99, 1, True, "FACE_VALID", "ok",
+            liveness=_spoof_result(),
+        )
+        with self.assertRaises(SpoofDetectedError):
+            enroll_user_biometrics(
+                user=self.user,
+                face_paths=["camera_1.jpg"],
+                iris_paths=["camera_1.jpg"],
+                voice_paths=["voice_1.wav"],
+                eye_side="LEFT",
+            )
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.face_template_encrypted)
+
+    @override_settings(FACE_PRIMARY_CAPTURE_MODE=True, DEVELOPMENT_THRESHOLDS=True)
+    @patch("biometrics.services.workflow.get_calibrated_thresholds")
+    @patch("biometrics.services.workflow.decrypt_template")
+    @patch("biometrics.services.workflow.get_face_engine")
+    @patch("biometrics.services.workflow.get_voice_engine")
+    @patch("biometrics.services.workflow.get_iris_engine")
+    def test_login_spoofed_face_is_rejected_as_spoof(
+        self, iris_engine, voice_engine, face_engine, decrypt, calibrated
+    ):
+        self._enroll_prototype()
+        decrypt.side_effect = [
+            {"vector": [0.2, 0.4, 0.6]},
+            {"vector": [0.4, 0.5, 0.6]},
+        ]
+        calibrated.return_value = self._thresholds()
+        # A high SCRFD detection confidence with a failed anti-spoofing result
+        # must still be rejected: detection confidence is not liveness.
+        face_engine.return_value.extract_features.return_value = FaceSample(
+            [0.2, 0.4, 0.6], 0.9, 0.99, 1, True, "FACE_VALID", "ok",
+            liveness=_spoof_result(),
+        )
+        face_engine.return_value.compare_samples.return_value = {
+            "face": {
+                "quality_score": 0.9,
+                "detection_confidence": 0.99,
+                "normalized_score": 0.95,
+                "raw_score": 0.9,
+                "valid_measurement": True,
+                "passed": True,
+                "sample_count": 1,
+            }
+        }
+        voice_engine.return_value.compare.return_value = {
+            "voice": {
+                "quality_score": 0.9,
+                "speech_activity_score": 0.85,
+                "segment_count": settings.MIN_VOICE_SEGMENTS,
+                "normalized_score": 0.9,
+                "raw_score": 0.8,
+                "passed": True,
+            }
+        }
+
+        result = authenticate_enrolled_user(
+            user=self.user,
+            face_paths=["camera_frame.jpg"],
+            iris_paths=["camera_frame.jpg"],
+            voice_path="login_voice.wav",
+            eye_side="LEFT",
+        )
+
+        self.assertEqual(result["decision"], Decision.REJECTED_SPOOF)
+        self.assertEqual(result["ui_state"], "REJECTED_SPOOF")
+        self.assertEqual(result["verification_status"], "REJECTED_SPOOF")
+        self.assertEqual(result["liveness"]["status"], "SPOOF")
+        self.assertFalse(result["liveness_result"])
+        self.assertTrue(result["failure_reason"])
+        self.assertEqual(result["face_similarity"], 0.95)
+        iris_engine.assert_not_called()
+
+    @override_settings(
+        FACE_PRIMARY_CAPTURE_MODE=True,
+        DEVELOPMENT_THRESHOLDS=True,
+        FACE_LIVENESS_REQUIRED=True,
+    )
+    @patch("biometrics.services.workflow.get_calibrated_thresholds")
+    @patch("biometrics.services.workflow.decrypt_template")
+    @patch("biometrics.services.workflow.get_face_engine")
+    @patch("biometrics.services.workflow.get_voice_engine")
+    @patch("biometrics.services.workflow.get_iris_engine")
+    def test_login_fails_closed_when_liveness_model_unavailable(
+        self, iris_engine, voice_engine, face_engine, decrypt, calibrated
+    ):
+        self._enroll_prototype()
+        decrypt.side_effect = [
+            {"vector": [0.2, 0.4, 0.6]},
+            {"vector": [0.4, 0.5, 0.6]},
+        ]
+        calibrated.return_value = self._thresholds()
+        face_engine.return_value.extract_features.return_value = FaceSample(
+            [0.2, 0.4, 0.6], 0.9, 0.95, 1, True, "FACE_VALID", "ok"
+        )
+        face_engine.return_value.compare_samples.return_value = {
+            "face": {
+                "quality_score": 0.9,
+                "detection_confidence": 0.95,
+                "normalized_score": 0.95,
+                "raw_score": 0.9,
+                "valid_measurement": True,
+                "passed": True,
+                "sample_count": 1,
+            }
+        }
+        voice_engine.return_value.compare.return_value = {
+            "voice": {
+                "quality_score": 0.9,
+                "speech_activity_score": 0.85,
+                "segment_count": settings.MIN_VOICE_SEGMENTS,
+                "normalized_score": 0.9,
+                "raw_score": 0.8,
+                "passed": True,
+            }
+        }
+
+        result = authenticate_enrolled_user(
+            user=self.user,
+            face_paths=["camera_frame.jpg"],
+            iris_paths=["camera_frame.jpg"],
+            voice_path="login_voice.wav",
+            eye_side="LEFT",
+        )
+
+        self.assertEqual(result["decision"], Decision.PROCESSING_ERROR)
+        self.assertEqual(result["verification_status"], "PROCESSING_ERROR")
+        self.assertEqual(result["liveness"]["status"], "UNAVAILABLE")
+        self.assertFalse(result["liveness_result"])
+        self.assertTrue(result["failure_reason"])
+
+    @override_settings(
+        FACE_PRIMARY_CAPTURE_MODE=True,
+        DEVELOPMENT_THRESHOLDS=True,
+        FACE_LIVENESS_REQUIRED=False,
+    )
+    @patch("biometrics.services.workflow.get_calibrated_thresholds")
+    @patch("biometrics.services.workflow.decrypt_template")
+    @patch("biometrics.services.workflow.get_face_engine")
+    @patch("biometrics.services.workflow.get_voice_engine")
+    @patch("biometrics.services.workflow.get_iris_engine")
+    def test_development_login_does_not_fabricate_liveness(
+        self, iris_engine, voice_engine, face_engine, decrypt, calibrated
+    ):
+        """When enforcement is off, liveness is still reported honestly."""
+        self._enroll_prototype()
+        decrypt.side_effect = [
+            {"vector": [0.2, 0.4, 0.6]},
+            {"vector": [0.4, 0.5, 0.6]},
+        ]
+        calibrated.return_value = self._thresholds()
+        face_engine.return_value.extract_features.return_value = FaceSample(
+            [0.2, 0.4, 0.6], 0.9, 0.95, 1, True, "FACE_VALID", "ok"
+        )
+        face_engine.return_value.compare_samples.return_value = {
+            "face": {
+                "quality_score": 0.9,
+                "detection_confidence": 0.95,
+                "normalized_score": 0.92,
+                "raw_score": 0.84,
+                "valid_measurement": True,
+                "passed": True,
+                "sample_count": 1,
+            }
+        }
+        voice_engine.return_value.compare.return_value = {
+            "voice": {
+                "quality_score": 0.9,
+                "speech_activity_score": 0.85,
+                "segment_count": settings.MIN_VOICE_SEGMENTS,
+                "normalized_score": 0.9,
+                "raw_score": 0.8,
+                "passed": True,
+            }
+        }
+
+        result = authenticate_enrolled_user(
+            user=self.user,
+            face_paths=["camera_frame.jpg"],
+            iris_paths=["camera_frame.jpg"],
+            voice_path="login_voice.wav",
+            eye_side="LEFT",
+        )
+
+        # The identity decision may still pass, but liveness is never claimed.
+        self.assertEqual(result["decision"], Decision.ACCEPTED)
+        self.assertEqual(result["liveness"]["status"], "UNAVAILABLE")
+        self.assertFalse(result["liveness_result"])
+        self.assertFalse(result["liveness"]["passed"])
+        self.assertIsNone(result["liveness"]["anti_spoof_model"])
+
+
+class HealthReadinessTests(TestCase):
+    """A missing anti-spoofing asset must not stall the global status."""
+
+    def setUp(self):
+        self.client = APIClient()
+
+    @patch("biometrics.views.get_service_health")
+    def test_status_is_ok_when_anti_spoof_model_is_missing(self, health):
+        health.return_value = {
+            "face_model": {"ready": True, "mode": "local_buffalo_l"},
+            "face_liveness_model": {"ready": False, "required": False},
+            "voice_model": {"ready": True, "mode": "local_pretrained"},
+            "iris_model": {"ready": True, "mode": "local_onnx"},
+            "offline_mode": True,
+            "development_thresholds": True,
+            "fusion_calibration_ready": False,
+            "fusion_threshold_source": "defaults",
+        }
+
+        response = self.client.get("/api/v1/health/")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["data"]
+        self.assertEqual(data["status"], "ok")
+        self.assertFalse(data["face_liveness_ready"])
+        self.assertTrue(data["face_verification_ready"])
 
 
 class BiometricsApiTests(TestCase):

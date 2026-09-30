@@ -252,6 +252,39 @@ FACE_MODEL_ROOT = Path(
     _env("FACE_MODEL_ROOT", str(LOCAL_TRAINED_MODELS_DIR / "face"))
 )
 FACE_MODEL_NAME = _env("FACE_MODEL_NAME", "buffalo_l")
+
+# Dedicated face anti-spoofing / liveness model (separate from the SCRFD face
+# detector). Detection confidence is never treated as liveness evidence. When
+# this asset is unavailable the face workflow fails closed instead of
+# pretending liveness passed.
+FACE_LIVENESS_MODEL_DIR = Path(
+    _env("FACE_LIVENESS_MODEL_DIR", str(LOCAL_TRAINED_MODELS_DIR / "face"))
+)
+FACE_LIVENESS_MODEL_PATH = Path(
+    _env(
+        "FACE_LIVENESS_MODEL_PATH",
+        str(FACE_LIVENESS_MODEL_DIR / "antispoof" / "minifasnet_v2.onnx"),
+    )
+)
+FACE_LIVENESS_MODEL_NAME = _env("FACE_LIVENESS_MODEL_NAME", "MiniFASNet face anti-spoofing")
+# Optional one-time provisioning URL. Only used when BIOMETRIC_OFFLINE_MODE is
+# False; offline deployments must place the ONNX file locally.
+FACE_LIVENESS_MODEL_URL = _env("FACE_LIVENESS_MODEL_URL", "")
+FACE_LIVENESS_INPUT_SIZE = int(_env("FACE_LIVENESS_INPUT_SIZE", "80"))
+FACE_LIVENESS_CROP_SCALE = _env_float("FACE_LIVENESS_CROP_SCALE", 2.7)
+# Index of the "live" class in the classifier output. MiniFASNetV2 emits three
+# logits ordered [print, live, replay] but variants differ, so it is configurable.
+FACE_LIVENESS_LIVE_INDEX = int(_env("FACE_LIVENESS_LIVE_INDEX", "1"))
+FACE_LIVENESS_ACTIVATION = _env("FACE_LIVENESS_ACTIVATION", "softmax")
+FACE_LIVENESS_THRESHOLD = _env_float("FACE_LIVENESS_THRESHOLD", 0.60)
+# When True, registration and login require an affirmative liveness result; a
+# missing model fails closed instead of silently skipping the anti-spoofing
+# stage. Defaults to production-strict (required only when DEBUG is off) so a
+# development machine without the anti-spoofing asset can still exercise the
+# face/iris/voice pipeline. A positive spoof detection is always rejected
+# regardless of this flag, and liveness is never reported as passed unless the
+# dedicated model actually ran and returned a live score.
+FACE_LIVENESS_REQUIRED = _env_bool("FACE_LIVENESS_REQUIRED", not DEBUG)
 VOICE_MIN_SECONDS = _env_float("VOICE_MIN_SECONDS", 2.0)
 VOICE_MAX_SECONDS = _env_float("VOICE_MAX_SECONDS", 15.0)
 VOICE_QUALITY_THRESHOLD = _env_float("VOICE_QUALITY_THRESHOLD", 0.55)
@@ -331,6 +364,11 @@ if not DEBUG:
     if FACE_PRIMARY_CAPTURE_MODE:
         raise ImproperlyConfigured(
             "FACE_PRIMARY_CAPTURE_MODE must be False in production."
+        )
+    if not FACE_LIVENESS_REQUIRED:
+        raise ImproperlyConfigured(
+            "FACE_LIVENESS_REQUIRED must be True in production so face "
+            "registration and login run the dedicated anti-spoofing model."
         )
     if DEVELOPMENT_THRESHOLDS:
         raise ImproperlyConfigured(
