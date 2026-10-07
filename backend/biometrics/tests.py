@@ -1641,6 +1641,83 @@ class BiometricsApiTests(TestCase):
         self.assertEqual(len(data["contour"]), 3)
         get_engine.return_value.track_iris.assert_called_once()
 
+    @patch("biometrics.views.get_iris_engine")
+    def test_iris_tracking_processing_error_returns_structured_422(
+        self, get_engine
+    ):
+        """A processing failure must carry a stable code the UI can use."""
+        get_engine.return_value.track_iris.side_effect = BiometricProcessingError(
+            "The live eye ROI or iris segmentation stage failed."
+        )
+        frame = SimpleUploadedFile(
+            "frame.jpg",
+            b"camera-frame",
+            content_type="image/jpeg",
+        )
+
+        response = self.client.post(
+            "/api/v1/test/iris/tracking/",
+            data={"frame": frame},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 422)
+        payload = response.json()
+        self.assertEqual(payload["error"], "IRIS_TRACKING_FAILED")
+        self.assertEqual(
+            payload["message"],
+            "The live eye ROI or iris segmentation stage failed.",
+        )
+
+    @patch("biometrics.views.get_iris_engine")
+    def test_iris_tracking_422_includes_reason_from_cause(self, get_engine):
+        """The underlying cause of the processing failure is surfaced."""
+        cause = ValueError("non-finite iris geometry")
+        processing_error = BiometricProcessingError(
+            "The live eye ROI or iris segmentation stage failed."
+        )
+        processing_error.__cause__ = cause
+        get_engine.return_value.track_iris.side_effect = processing_error
+        frame = SimpleUploadedFile(
+            "frame.jpg",
+            b"camera-frame",
+            content_type="image/jpeg",
+        )
+
+        response = self.client.post(
+            "/api/v1/test/iris/tracking/",
+            data={"frame": frame},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 422)
+        payload = response.json()
+        self.assertEqual(payload["error"], "IRIS_TRACKING_FAILED")
+        self.assertEqual(payload["reason"], "ValueError: non-finite iris geometry")
+
+    @patch("biometrics.views.get_iris_engine")
+    def test_iris_tracking_unexpected_error_returns_structured_500(
+        self, get_engine
+    ):
+        """Unexpected engine crashes become a structured 500, not a 500 page."""
+        get_engine.return_value.track_iris.side_effect = RuntimeError("boom")
+        frame = SimpleUploadedFile(
+            "frame.jpg",
+            b"camera-frame",
+            content_type="image/jpeg",
+        )
+
+        response = self.client.post(
+            "/api/v1/test/iris/tracking/",
+            data={"frame": frame},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 500)
+        payload = response.json()
+        self.assertEqual(payload["error"], "IRIS_TRACKING_FAILED")
+        self.assertIn("could not be processed", payload["message"])
+
     def test_banking_registration_creates_customer_and_biometric_user(self):
         response = self.client.post(
             "/api/v1/banking/register/",

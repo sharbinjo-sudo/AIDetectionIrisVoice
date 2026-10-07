@@ -15,7 +15,17 @@ import '../../data/iris_tracking_repository.dart';
 import '../../models/iris_tracking_filter.dart';
 import '../../models/iris_tracking_result.dart';
 
-enum _LiveTrackingState { starting, searching, uncertain, locked, unavailable }
+enum _LiveTrackingState {
+  starting,
+  searching,
+  uncertain,
+  locked,
+  // The backend was reached but the frame could not be processed (HTTP 4xx):
+  // the backend's reason is shown instead of blaming connectivity.
+  processingFailure,
+  // Network failure / connection refused / 5xx: the backend is unusable.
+  unavailable,
+}
 
 class LiveCameraPanel extends ConsumerStatefulWidget {
   const LiveCameraPanel({
@@ -435,18 +445,27 @@ class _LiveCameraPanelState extends ConsumerState<LiveCameraPanel>
   }
 
   void _showTrackingFailure(Object error, int generation) {
-    if (mounted && generation == _trackingGeneration) {
-      for (final filter in _trackingFilters.values) {
-        filter.markLost(_timestampSeconds());
-      }
-      setState(() {
-        _tracking = const [];
-        _eyeRois = const [];
-        _trackingSourceSize = null;
-        _trackingState = _LiveTrackingState.unavailable;
-        _trackingFailure = error.toString();
-      });
+    if (!mounted || generation != _trackingGeneration) {
+      return;
     }
+    final failure = error is IrisTrackingFailedException
+        ? error
+        : null;
+    final isProcessingFailure = failure != null;
+    final detail = failure?.reason;
+    final message = failure?.message ?? error.toString();
+    for (final filter in _trackingFilters.values) {
+      filter.markLost(_timestampSeconds());
+    }
+    setState(() {
+      _tracking = const [];
+      _eyeRois = const [];
+      _trackingSourceSize = null;
+      _trackingState = isProcessingFailure
+          ? _LiveTrackingState.processingFailure
+          : _LiveTrackingState.unavailable;
+      _trackingFailure = detail == null ? message : '$message ($detail)';
+    });
   }
 
   double _timestampSeconds() {
@@ -651,6 +670,7 @@ class _LiveCameraPanelState extends ConsumerState<LiveCameraPanel>
           state: _trackingState,
           trackedEyeCount: _tracking.length,
           debugDetail: alignmentDebug ? _trackingFailure : null,
+          failureDetail: _trackingFailure,
         ),
         const SizedBox(height: 4),
         LinearProgressIndicator(
@@ -694,14 +714,21 @@ class _TrackingStatus extends StatelessWidget {
     required this.state,
     required this.trackedEyeCount,
     this.debugDetail,
+    this.failureDetail,
   });
 
   final _LiveTrackingState state;
   final int trackedEyeCount;
   final String? debugDetail;
+  final String? failureDetail;
 
   @override
   Widget build(BuildContext context) {
+    // The backend's processing-failure reason is always shown for 4xx states;
+    // other states only show extra detail when alignment debug is enabled.
+    final effectiveDetail = state == _LiveTrackingState.processingFailure
+        ? (failureDetail ?? debugDetail)
+        : debugDetail;
     final (icon, message, color) = switch (state) {
       _LiveTrackingState.starting => (
         Icons.sync,
@@ -723,6 +750,11 @@ class _TrackingStatus extends StatelessWidget {
         '$trackedEyeCount ${trackedEyeCount == 1 ? 'iris' : 'irises'} locked — tracking live video.',
         Colors.green,
       ),
+      _LiveTrackingState.processingFailure => (
+        Icons.visibility_off_outlined,
+        'The eye/frame could not be processed for tracking.',
+        Theme.of(context).colorScheme.error,
+      ),
       _LiveTrackingState.unavailable => (
         Icons.error_outline,
         'Live iris tracking is unavailable. Check that the backend is running.',
@@ -738,7 +770,9 @@ class _TrackingStatus extends StatelessWidget {
           const SizedBox(width: 8),
           Expanded(
             child: Text(
-              debugDetail == null ? message : '$message\n$debugDetail',
+              effectiveDetail == null
+                  ? message
+                  : '$message\n$effectiveDetail',
               style: Theme.of(
                 context,
               ).textTheme.bodySmall?.copyWith(color: color),

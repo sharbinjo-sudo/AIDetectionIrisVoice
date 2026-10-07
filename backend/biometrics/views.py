@@ -27,7 +27,7 @@ from .serializers import (
     UserSerializer,
     VoiceTestRequestSerializer,
 )
-from .services.exceptions import BiometricServiceError
+from .services.exceptions import BiometricProcessingError, BiometricServiceError
 from .services.workflow import (
     authenticate_enrolled_user,
     enroll_user_biometrics,
@@ -66,8 +66,44 @@ def success_response(data, response_status=status.HTTP_200_OK) -> Response:
     return Response({"data": data}, status=response_status)
 
 
-def error_response(message: str, response_status: int) -> Response:
-    return Response({"message": message}, status=response_status)
+def error_response(
+    message: str,
+    response_status: int,
+    *,
+    code: str | None = None,
+    reason: str | None = None,
+) -> Response:
+    """Build the API error envelope, optionally with structured diagnostics.
+
+    ``code`` is a stable machine-readable error identifier (e.g.
+    ``IRIS_TRACKING_FAILED``) and ``reason`` carries extra diagnostic detail
+    beyond the human-readable ``message``. Both are optional so existing
+    ``{"message": ...}`` responses stay unchanged.
+    """
+    payload = {"message": message}
+    if code:
+        payload["error"] = code
+    if reason and reason != message:
+        payload["reason"] = reason
+    return Response(payload, status=response_status)
+
+
+def _log_tracking_failure(exc: Exception, response_status: int) -> None:
+    """Log the real iris-tracking failure (and its cause) in development.
+
+    Live tracking posts a frame continuously, so per-frame failures are
+    logged only when DEBUG is on; production keeps them out of the logs.
+    """
+    if not settings.DEBUG:
+        return
+    cause = exc.__cause__ or exc.__context__
+    logger.warning(
+        "iris tracking failure response: status=%d error=%s message=%s cause=%s",
+        response_status,
+        type(exc).__name__,
+        exc,
+        f"{type(cause).__name__}: {cause}" if cause else None,
+    )
 
 
 class HealthView(APIView):
@@ -242,8 +278,30 @@ class IrisTrackingView(APIView):
                 suffix=".jpg",
             ) as path:
                 result = get_iris_engine().track_iris(path)
+        except BiometricProcessingError as exc:
+            # A 4xx from this endpoint means the backend WAS reached but the
+            # frame could not be processed. The response must say so with a
+            # stable error code plus the actual reason, so the frontend can
+            # distinguish it from "backend unavailable" instead of treating
+            # every non-200 as a connectivity problem.
+            _log_tracking_failure(exc, exc.status_code)
+            cause = exc.__cause__ or exc.__context__
+            return error_response(
+                str(exc),
+                exc.status_code,
+                code="IRIS_TRACKING_FAILED",
+                reason=f"{type(cause).__name__}: {cause}" if cause else None,
+            )
         except BiometricServiceError as exc:
+            _log_tracking_failure(exc, exc.status_code)
             return error_response(str(exc), exc.status_code)
+        except Exception as exc:
+            logger.exception("Iris tracking request failed unexpectedly.")
+            return error_response(
+                "The live eye tracking request could not be processed.",
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                code="IRIS_TRACKING_FAILED",
+            )
         return success_response(result)
 
 
