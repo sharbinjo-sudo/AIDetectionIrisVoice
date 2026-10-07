@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import logging
 import math
 from pathlib import Path
 from threading import Lock
@@ -14,6 +15,110 @@ from .face_liveness import (
     error_result,
     get_face_liveness_engine,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _stride_for_rows(rows: int, expected_rows: dict[int, int]) -> int | None:
+    """Map an SCRFD tensor's row count to its FPN stride, or None."""
+    for stride, expected in expected_rows.items():
+        if rows == expected:
+            return stride
+    return None
+
+
+def _group_scrfd_outputs(outputs, *, np, expected_rows: dict[int, int]) -> dict[int, tuple]:
+    """Group raw SCRFD output tensors per FPN stride, identified by shape.
+
+    det_10g (buffalo_l SCRFD) emits three tensors per stride with 2 anchors
+    per grid location: scores ``(rows, 1)``, bbox distances ``(rows, 4)`` and
+    keypoint distances ``(rows, 10)``. The widths (1 / 4 / 10) and row counts
+    identify every tensor unambiguously, so they are matched **by shape**
+    instead of by position: cv2.dnn does not guarantee the order of the
+    requested outputs across builds, and a reordered response previously put
+    the bbox tensor into the keypoint slot, crashing with
+    ``cannot reshape array of size 4 into shape (5, 2)``.
+
+    Returns ``{stride: (scores, distances, keypoint_distances)}``. Raises
+    ``BiometricProcessingError`` when the tensors cannot be interpreted
+    safely: an incomplete stride group, a 4-keypoint (8-value) landmark
+    tensor, or any other layout inconsistent with the expected det_10g
+    architecture. Bounding-box detection never proceeds on a misread tensor
+    layout, and landmarks are never fabricated from a wrong tensor.
+    """
+    if not outputs:
+        raise BiometricProcessingError(
+            "The SCRFD face detector returned no output tensors; the face "
+            "model asset may be corrupted or incompatible."
+        )
+
+    scores_by_stride: dict[int, object] = {}
+    distances_by_stride: dict[int, object] = {}
+    keypoint_tensor_by_stride: dict[int, object] = {}
+    observed: list[str] = []
+
+    for tensor in outputs:
+        array = np.asarray(tensor)
+        observed.append(f"{array.shape}:{array.dtype}")
+        if array.ndim != 2 or array.shape[0] == 0:
+            continue
+        rows, width = array.shape
+        stride = _stride_for_rows(rows, expected_rows)
+        if stride is None:
+            continue
+        if width == 1 and stride not in scores_by_stride:
+            scores_by_stride[stride] = array
+        elif width == 4 and stride not in distances_by_stride:
+            distances_by_stride[stride] = array
+        elif width in (2 * 5, 2 * 4) and stride not in keypoint_tensor_by_stride:
+            keypoint_tensor_by_stride[stride] = array
+
+    for stride in sorted(expected_rows):
+        if stride not in scores_by_stride or stride not in distances_by_stride:
+            raise BiometricProcessingError(
+                "The SCRFD face detector output could not be interpreted: "
+                "expected per-stride tensors scores (rows, 1), bbox distances "
+                "(rows, 4) and keypoint distances (rows, 10) for strides "
+                f"{sorted(expected_rows)}, but observed shapes "
+                f"[{', '.join(observed)}]. The face model asset may be "
+                "corrupted or incompatible with the expected SCRFD "
+                "architecture."
+            )
+        keypoint_tensor = keypoint_tensor_by_stride.get(stride)
+        keypoint_width = (
+            int(np.asarray(keypoint_tensor).shape[1]) if keypoint_tensor is not None else 0
+        )
+        if keypoint_width == 2 * 4:
+            raise BiometricProcessingError(
+                "The loaded SCRFD model provides only 4 keypoint values per "
+                "anchor (8-value landmark tensor), but the buffalo_l "
+                "alignment pipeline requires 5 landmarks (10 values). The "
+                "face model asset is incompatible with this engine; provision "
+                "the det_10g.onnx detector from buffalo_l instead of "
+                "silently producing incorrect landmarks."
+            )
+        if keypoint_width != 2 * 5:
+            raise BiometricProcessingError(
+                "The SCRFD face detector output could not be interpreted: no "
+                "5-keypoint (10-value) landmark tensor was found for stride "
+                f"{stride}; observed shapes [{', '.join(observed)}]. The face "
+                "model asset may be corrupted or incompatible with the "
+                "expected det_10g architecture."
+            )
+
+    grouped = {
+        stride: (
+            scores_by_stride[stride],
+            distances_by_stride[stride],
+            keypoint_tensor_by_stride[stride],
+        )
+        for stride in sorted(expected_rows)
+    }
+    logger.debug(
+        "SCRFD output tensors: %s",
+        ", ".join(observed),
+    )
+    return grouped
 
 
 def _clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
@@ -107,6 +212,33 @@ class FaceBiometricEngine:
                 str(model_dir / "w600k_r50.onnx")
             )
             self._detector_outputs = self._detector.getUnconnectedOutLayersNames()
+            # One-time diagnostic: log the actual SCRFD output tensor names,
+            # shapes and dtypes so a machine whose OpenCV reorders the
+            # outputs (or ships an incompatible det_XXg export) can be
+            # diagnosed from its logs. Never affects detection.
+            try:
+                probe_blob = self._cv2.dnn.blobFromImage(
+                    self._np.zeros((640, 640, 3), dtype=self._np.uint8),
+                    scalefactor=1.0 / 128.0,
+                    size=(640, 640),
+                    mean=(127.5, 127.5, 127.5),
+                    swapRB=True,
+                )
+                self._detector.setInput(probe_blob)
+                probe_outputs = self._detector.forward(self._detector_outputs)
+                described = [
+                    f"{name}: shape={np.asarray(out).shape} dtype={np.asarray(out).dtype}"
+                    for name, out in zip(self._detector_outputs, probe_outputs)
+                ]
+                logger.info(
+                    "SCRFD det_10g output tensors: %s",
+                    "; ".join(described),
+                )
+            except Exception as probe_error:  # pragma: no cover - diagnostics
+                logger.warning(
+                    "Could not probe SCRFD output tensors at load time: %s",
+                    probe_error,
+                )
         except Exception as exc:
             self._load_error = exc
             self._detector = None
@@ -215,9 +347,17 @@ class FaceBiometricEngine:
             self._detector.setInput(blob)
             outputs = self._detector.forward(self._detector_outputs)
 
+        # Group the raw SCRFD tensors by shape (see _group_scrfd_outputs);
+        # some OpenCV builds return the requested outputs in a different
+        # order, so positional slicing previously selected the wrong tensor.
+        expected_rows = {
+            stride: 2 * (640 // stride) ** 2 for stride in (8, 16, 32)
+        }
+        groups = _group_scrfd_outputs(outputs, np=self._np, expected_rows=expected_rows)
+
         proposals: list[dict] = []
-        for level, stride in enumerate((8, 16, 32)):
-            scores, distances, keypoint_distances = outputs[level * 3 : level * 3 + 3]
+        for stride in (8, 16, 32):
+            scores, distances, keypoint_distances = groups[stride]
             grid_height, grid_width = 640 // stride, 640 // stride
             centers = self._np.stack(
                 self._np.mgrid[:grid_height, :grid_width][::-1],
@@ -248,7 +388,17 @@ class FaceBiometricEngine:
                 bbox[2] += offset_x
                 bbox[1] += offset_y
                 bbox[3] += offset_y
-                raw_kps = keypoint_distances[index].reshape((5, 2)) * stride
+                raw_kps_values = keypoint_distances[index]
+                if raw_kps_values.size != 10:
+                    # Defensive: the shape grouping above already guarantees
+                    # a 10-value tensor; fail loudly instead of blindly
+                    # reshaping arbitrary arrays.
+                    raise BiometricProcessingError(
+                        "The SCRFD keypoint tensor for a detected face had "
+                        f"{raw_kps_values.size} values; 10 (5 landmarks) are "
+                        "required."
+                    )
+                raw_kps = raw_kps_values.reshape((5, 2)) * stride
                 kps = self._np.empty((5, 2), dtype=self._np.float32)
                 kps[:, 0] = (center[0] + raw_kps[:, 0]) / scale + offset_x
                 kps[:, 1] = (center[1] + raw_kps[:, 1]) / scale + offset_y

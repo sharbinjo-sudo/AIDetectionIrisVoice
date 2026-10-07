@@ -24,8 +24,16 @@ from .models import (
 )
 from .services.engines import IrisBiometricEngine, VoiceBiometricEngine
 from .services.engines import IrisSample, VoiceSample
-from .services.exceptions import ModelUnavailableError, SpoofDetectedError
-from .services.face_engine import FaceSample
+from .services.exceptions import (
+    BiometricProcessingError,
+    ModelUnavailableError,
+    SpoofDetectedError,
+)
+from .services.face_engine import (
+    FaceBiometricEngine,
+    FaceSample,
+    _group_scrfd_outputs,
+)
 from .services.face_liveness import FaceLivenessEngine, LivenessResult
 from .services.face_liveness import summarize_liveness
 from .services.fusion import (
@@ -1056,6 +1064,158 @@ class FaceLivenessEngineTests(TestCase):
         self.assertFalse(result.passed)
         self.assertEqual(result.status, "UNAVAILABLE")
         self.assertEqual(result.reason_code, "LIVENESS_MODEL_UNAVAILABLE")
+
+
+def _scrfd_tensor(stride_rows: int, width: int, fill: float = 1.0, *, np):
+    """Build one SCRFD output tensor (rows, width) with deterministic values."""
+    return np.full((stride_rows, width), fill, dtype=np.float32)
+
+
+class _FakeScrfdNet:
+    """Stand-in for the det_10g cv2.dnn network returning canned tensors."""
+
+    def __init__(self, outputs):
+        self.outputs = outputs
+
+    def setInput(self, value):
+        self.input = value
+
+    def forward(self, names):
+        return self.outputs
+
+
+def _make_face_engine_with_detector(np, outputs):
+    """Build a FaceBiometricEngine wired to a fake SCRFD net."""
+    import cv2
+
+    engine = FaceBiometricEngine.__new__(FaceBiometricEngine)
+    engine._cv2 = cv2
+    engine._recognizer = object()
+    engine._np = np
+    engine._detector = _FakeScrfdNet(outputs)
+    engine._detector_outputs = [f"out_{index}" for index in range(len(outputs))]
+    engine._model_dir = Path("unused")
+    engine._load_error = None
+    engine._lock = Lock()
+    return engine
+
+
+class ScrfdOutputParsingTests(TestCase):
+    """SCRFD tensors must be matched by shape, not by output order."""
+
+    def _expected_rows(self):
+        return {stride: 2 * (640 // stride) ** 2 for stride in (8, 16, 32)}
+
+    def _canonical_outputs(self, np):
+        """The det_10g layout: per stride, scores/distances/landmarks."""
+        rows = self._expected_rows()
+        outputs = []
+        for stride in (8, 16, 32):
+            outputs.append(_scrfd_tensor(rows[stride], 1, 0.5, np=np))
+            outputs.append(_scrfd_tensor(rows[stride], 4, 1.0, np=np))
+            outputs.append(_scrfd_tensor(rows[stride], 10, 1.0, np=np))
+        return outputs
+
+    def test_grouping_matches_reference_order_including_one_stride(self):
+        import numpy as np
+
+        outputs = self._canonical_outputs(np)
+        groups = _group_scrfd_outputs(outputs, np=np, expected_rows=self._expected_rows())
+        for stride in (8, 16, 32):
+            scores, distances, kps = groups[stride]
+            self.assertEqual(scores.shape, (self._expected_rows()[stride], 1))
+            self.assertEqual(distances.shape, (self._expected_rows()[stride], 4))
+            self.assertEqual(kps.shape, (self._expected_rows()[stride], 10))
+
+    def test_grouping_tolerates_reordered_outputs(self):
+        """A different output order must still yield the same grouping."""
+        import numpy as np
+
+        outputs = list(reversed(self._canonical_outputs(np)))
+        groups = _group_scrfd_outputs(outputs, np=np, expected_rows=self._expected_rows())
+        _, _, kps = groups[8]
+        self.assertEqual(kps.shape, (self._expected_rows()[8], 10))
+
+    def test_grouping_rejects_four_keypoint_model(self):
+        """A 4-landmark (8-value) SCRFD model is incompatible, fail loudly."""
+        import numpy as np
+
+        rows = self._expected_rows()
+        outputs = []
+        for stride in (8, 16, 32):
+            outputs.append(_scrfd_tensor(rows[stride], 1, 0.5, np=np))
+            outputs.append(_scrfd_tensor(rows[stride], 4, 1.0, np=np))
+            outputs.append(_scrfd_tensor(rows[stride], 8, 1.0, np=np))
+        with self.assertRaises(BiometricProcessingError) as ctx:
+            _group_scrfd_outputs(outputs, np=np, expected_rows=self._expected_rows())
+        self.assertIn("4 keypoint values", str(ctx.exception))
+
+    def test_grouping_rejects_incomplete_stride_group(self):
+        """A missing keypoint tensor must fail closed, not guess."""
+        import numpy as np
+
+        rows = self._expected_rows()
+        outputs = []
+        for stride in (8, 16, 32):
+            outputs.append(_scrfd_tensor(rows[stride], 1, 0.5, np=np))
+            outputs.append(_scrfd_tensor(rows[stride], 4, 1.0, np=np))
+        with self.assertRaises(BiometricProcessingError) as ctx:
+            _group_scrfd_outputs(outputs, np=np, expected_rows=self._expected_rows())
+        self.assertIn("could not be interpreted", str(ctx.exception))
+
+    def test_grouping_rejects_unexpected_stride_rows(self):
+        """Row counts inconsistent with strides 8/16/32 must fail closed."""
+        import numpy as np
+
+        outputs = [
+            np.zeros((100, 1), dtype=np.float32),
+            np.zeros((100, 4), dtype=np.float32),
+            np.zeros((100, 10), dtype=np.float32),
+        ]
+        with self.assertRaises(BiometricProcessingError) as ctx:
+            _group_scrfd_outputs(outputs, np=np, expected_rows=self._expected_rows())
+        self.assertIn("could not be interpreted", str(ctx.exception))
+
+    def test_detect_faces_single_reports_incompatible_model(self):
+        """The 4-keypoint crash must surface as BiometricProcessingError."""
+        import numpy as np
+
+        rows = self._expected_rows()
+        outputs = []
+        for stride in (8, 16, 32):
+            outputs.append(_scrfd_tensor(rows[stride], 1, 0.9, np=np))
+            outputs.append(_scrfd_tensor(rows[stride], 4, 1.0, np=np))
+            outputs.append(_scrfd_tensor(rows[stride], 8, 1.0, np=np))
+        engine = _make_face_engine_with_detector(np, outputs)
+        image = np.zeros((480, 640, 3), dtype=np.uint8)
+        with self.assertRaises(BiometricProcessingError) as ctx:
+            engine._detect_faces_single(image)
+        self.assertIn("4 keypoint values", str(ctx.exception))
+
+    def test_detect_faces_single_splits_keypoints_from_reordered_outputs(self):
+        """Reordered outputs still produce correct bboxes and 5 landmarks."""
+        import numpy as np
+
+        rows = self._expected_rows()
+        outputs = []
+        for stride in (8, 16, 32):
+            # Anchor 0 of each pair scores 0.9 only for stride 8.
+            scores = np.zeros((rows[stride], 1), dtype=np.float32)
+            if stride == 8:
+                scores[::2, 0] = 0.9
+            distances = np.ones((rows[stride], 4), dtype=np.float32)
+            kps = np.ones((rows[stride], 10), dtype=np.float32)
+            outputs.extend([kps, distances, scores])
+        # Fully reversed tensor order (kps, distances, scores per stride).
+        outputs = list(reversed(outputs))
+        engine = _make_face_engine_with_detector(np, outputs)
+        image = np.zeros((640, 640, 3), dtype=np.uint8)
+        faces = engine._detect_faces_single(image)
+        self.assertEqual(len(faces), 2)  # NMS keeps only distinct bboxes.
+        for face in faces:
+            self.assertEqual(np.asarray(face["kps"]).shape, (5, 2))
+            self.assertEqual(len(face["bbox"]), 4)
+            self.assertAlmostEqual(face["score"], 0.9, places=5)
 
 
 class FaceLivenessWorkflowTests(TestCase):
