@@ -690,6 +690,15 @@ class IrisBiometricEngine:
             grayscale=pixels,
         )
 
+    def face_landmarks(self, image) -> list[object]:
+        """Public read-only landmark access for the liveness challenge.
+
+        Thin wrapper over the internal MediaPipe landmark detection; the
+        challenge liveness service reads normalized eye/nose points to
+        verify blink and head-turn actions. No iris logic is changed.
+        """
+        return self._detect_landmarks(image)
+
     def _detect_landmarks(self, image) -> list[object]:
         assert self._cv2 is not None
         assert self._mp is not None

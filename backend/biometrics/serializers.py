@@ -108,6 +108,24 @@ class IrisTrackingRequestSerializer(serializers.Serializer):
     )
 
 
+def _validate_challenge_frame(upload):
+    return _validate_upload(
+        upload,
+        maximum_bytes=settings.MAX_TRACKING_FRAME_BYTES,
+        label="challenge frame",
+    )
+
+
+class LivenessChallengeVerifyRequestSerializer(serializers.Serializer):
+    challenge_id = serializers.CharField(max_length=64)
+    frames = serializers.ListField(
+        child=serializers.FileField(validators=[_validate_challenge_frame]),
+        min_length=settings.FACE_CHALLENGE_MIN_FRAMES,
+        max_length=settings.FACE_CHALLENGE_MAX_FRAMES,
+        allow_empty=False,
+    )
+
+
 class VoiceTestRequestSerializer(serializers.Serializer):
     voice_file = serializers.FileField(validators=[validate_voice_upload])
     mode = serializers.ChoiceField(choices=["quality_only"], default="quality_only")
@@ -126,6 +144,9 @@ class BiometricAuthenticateRequestSerializer(serializers.Serializer):
     voice_file = serializers.FileField(validators=[validate_voice_upload])
     eye_side = serializers.ChoiceField(choices=["LEFT", "RIGHT"], default="LEFT")
     challenge_phrase = serializers.CharField(required=False, allow_blank=True)
+    # Signed single-use token from a verified liveness challenge (required in
+    # production, where FACE_LIVENESS_REQUIRED=True).
+    liveness_challenge = serializers.CharField(required=False, allow_blank=True)
 
 
 class BiometricEnrollmentRequestSerializer(serializers.Serializer):
@@ -142,6 +163,9 @@ class BiometricEnrollmentRequestSerializer(serializers.Serializer):
         minimum=settings.MIN_VOICE_SAMPLES,
     )
     eye_side = serializers.ChoiceField(choices=["LEFT", "RIGHT"], default="LEFT")
+    # Signed single-use token from a verified liveness challenge (required in
+    # production, where FACE_LIVENESS_REQUIRED=True).
+    liveness_challenge = serializers.CharField(required=False, allow_blank=True)
 
 
 class BankingCustomerSerializer(serializers.ModelSerializer):

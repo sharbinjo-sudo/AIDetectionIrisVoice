@@ -1,36 +1,40 @@
-"""MiniFASNet A/B/C diagnostic + production verification.
+"""MiniFASNetV2 convention + live-vs-spoof diagnostic.
 
-RESOLVED (2026-09): the A/B/C diagnostic fixed the integration conventions.
-Production now feeds raw 0-255 float32 (no /255) and treats class index 1 as
-Real, matching the upstream implementation
-(yakhyo/face-anti-spoofing onnx_inference.py). Evidence on a genuine webcam
-face, same crop:
-    TEST A  production-OLD /255:     softmax=[0.0004, 0.0061, 0.9935] argmax=2
-    TEST B  raw 0-255:               softmax=[0.0071, 0.9799, 0.0131] argmax=1
-    TEST C  upstream-replica crop:   softmax=[0.0112, 0.9413, 0.0475] argmax=1
-The Hugging Face model card documents /255 with class 0 = live, but the
-checkpoint's actual behaviour matches upstream. The convention was NOT chosen
-because it produces PASS.
+Purpose
+-------
+Decide — with evidence, not convenience — which inference convention the
+deployed MiniFASNetV2 checkpoint actually implements, and whether the model
+alone separates live faces from photo/screen/print attacks.
 
-What this script does now:
-  1. ONE real frame -> SCRFD exactly one face -> ONE crop, saved for inspection.
-  2. TEST A/B/C preprocessing comparison on that same crop (kept as evidence).
-  3. PRODUCTION verification: the engine's own assess() runs on the same
-     frame, printing raw logits, softmax, predicted class, live probability,
-     spoof probability, and the deployed conventions; with
-     FACE_LIVENESS_DEBUG_SAVE_CROP=True the exact classifier-input crop is
-     saved under media/liveness_debug/ for inspection.
+For EVERY sample (genuine webcam face, phone photo, printed photo, replayed
+video, or any still image) the script:
+
+1. verifies the exact ONNX model hash on this machine,
+2. runs the PRODUCTION SCRFD detector and takes the PRODUCTION face crop
+   (biometrics.services.face_liveness.FaceLivenessEngine._square_face_crop),
+   byte-compared against the crop production itself persists via
+   FACE_LIVENESS_DEBUG_SAVE_CROP,
+3. runs the SAME 80x80 crop through both candidate pipelines:
+   TEST A: BGR float32 / 255, class order [live, print, replay]  (model card)
+   TEST B: BGR float32 raw 0-255, class 1 = Real                  (upstream)
+4. records raw logits, softmax, predicted class, live probability, spoof
+   probability and the final decision for BOTH pipelines and BOTH class
+   mappings, then summarises the live-vs-spoof separation per pipeline.
+
+The pipeline is NOT selected because a genuine face passes: the decision
+weighs the reference implementation (provenance) AND the observed
+live-vs-spoof separation.
 
 Usage:
-    python diag_liveness.py                # one webcam frame
-    python diag_liveness.py some_face.jpg  # analyse a still image instead
+    python diag_liveness.py                          # one webcam frame
+    python diag_liveness.py img.jpg [img2.jpg ...]   # still images
+    python diag_liveness.py --capture 4 12           # 4 webcam frames, 12s apart
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
-import math
 import os
 import sys
 import time
@@ -44,16 +48,19 @@ import django  # noqa: E402
 
 django.setup()
 
+from django.conf import settings  # noqa: E402
+
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-START = time.perf_counter()
+EXPECTED_MODEL_SHA256 = "d7b3cd9ba8a7ceb13baa8c4720902e27ca3112eff52f926c08804af6b6eecc7b"
+THRESHOLD = None  # filled from settings in main()
 
 
 def step(message: str) -> None:
-    print(f"[{time.perf_counter() - START:7.2f}s] {message}", flush=True)
+    print(message, flush=True)
 
 
 def fail(message: str) -> int:
@@ -61,50 +68,34 @@ def fail(message: str) -> int:
     return 1
 
 
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def numpy_softmax(values) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float64)
+    exponentials = np.exp(array - array.max())
+    return exponentials / exponentials.sum()
+
+
 def capture_one_frame() -> np.ndarray | None:
-    """The exact camera sequence confirmed working on this machine."""
-    step("camera: cv2.VideoCapture(0, cv2.CAP_DSHOW)")
+    """The camera sequence confirmed working on this machine."""
     capture = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     if not capture.isOpened():
         fail("cv2.VideoCapture(0, cv2.CAP_DSHOW) could not be opened.")
         return None
-    step("camera: opened=True")
-
-    ok, frame = capture.read()
-    if not ok or frame is None:
-        capture.release()
-        fail("capture.read() returned no frame.")
-        return None
-    step(f"camera: first real frame shape={frame.shape}")
-
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    # Warm-up: the first DSHOW frames can be stale/unexposed, so grab a few
-    # and keep the last (diagnostic-only; production captures a live stream).
     frame = None
-    for attempt in range(15):
+    for _ in range(15):
         ok, frame = capture.read()
         if not ok or frame is None:
             capture.release()
-            fail("capture.read() after setting 640x480 returned no frame.")
+            fail("capture.read() returned no frame.")
             return None
-        if attempt < 14:
-            time.sleep(0.05)
-    if frame is None:
-        capture.release()
-        fail("capture.read() after setting 640x480 returned no frame.")
-        return None
-    step(f"camera: warm-up complete, frame shape={frame.shape}")
-
+        time.sleep(0.05)
     capture.release()
-    step("camera: released")
     return frame
-
-
-def numpy_softmax(values: list[float]) -> np.ndarray:
-    array = np.asarray(values, dtype=np.float64)
-    exponentials = np.exp(array - array.max())
-    return exponentials / exponentials.sum()
 
 
 def forward_blob(liveness, blob) -> list[float]:
@@ -113,233 +104,206 @@ def forward_blob(liveness, blob) -> list[float]:
         return np.asarray(liveness._net.forward()).reshape(-1).tolist()
 
 
-def app_probabilities(liveness, raw_logits) -> list[float]:
-    """The engine's exact activation handling (_probabilities)."""
-    return liveness._probabilities(raw_logits)
-
-
-def report_test(
+def evaluate_sample(
+    liveness,
+    detector,
     label: str,
-    blob: np.ndarray,
-    raw_logits: list[float],
-    scale_note: str,
-) -> None:
-    probabilities = numpy_softmax(raw_logits)
-    argmax = int(np.argmax(probabilities))
-    print(f"\n----- {label} ({scale_note}) -----")
-    print(f"tensor min/max:   {float(blob.min()):.6f} / {float(blob.max()):.6f}")
-    print(f"tensor dtype/shape: {blob.dtype} {blob.shape}")
-    print(f"raw logits:       {[round(v, 4) for v in raw_logits]}")
-    print(f"softmax:          {[round(float(v), 4) for v in probabilities]}")
-    print(f"argmax class:     {argmax}")
-
-
-def upstream_crop(image: np.ndarray, bbox_xyxy: list[float], scale: float, size: int) -> np.ndarray:
-    """Byte-exact replica of yakhyo/face-anti-spoofing onnx_inference.py.
-
-    _xyxy2xywh -> _crop_face (scale = min((H-1)/h, (W-1)/w, scale), centred,
-    clamped, no padding) -> float32 (NO /255) -> CHW -> NCHW.
-    """
-    x1, y1, x2, y2 = bbox_xyxy
-    x, y, box_w, box_h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
-    src_h, src_w = image.shape[:2]
-    used = min((src_h - 1) / box_h, (src_w - 1) / box_w, scale)
-    new_w = box_w * used
-    new_h = box_h * used
-    center_x = x + box_w / 2
-    center_y = y + box_h / 2
-    x1c = max(0, int(center_x - new_w / 2))
-    y1c = max(0, int(center_y - new_h / 2))
-    x2c = min(src_w - 1, int(center_x + new_w / 2))
-    y2c = min(src_h - 1, int(center_y + new_h / 2))
-    cropped = image[y1c : y2c + 1, x1c : x2c + 1]
-    face = cv2.resize(cropped, (size, size)).astype(np.float32)
-    face = np.transpose(face, (2, 0, 1))
-    return np.expand_dims(face, axis=0), used
-
-
-def production_verification(liveness, frame, bbox) -> int:
-    """Run the deployed assess() on the SAME frame and report full diagnostics."""
-    from django.conf import settings
-
-    step("[7/6] PRODUCTION verification: engine.assess() on the same frame")
-    print(
-        "deployed conventions: BGR, 80x80, NCHW, raw 0-255 float32 "
-        f"(no /255), crop scale {settings.FACE_LIVENESS_CROP_SCALE}, "
-        f"live_index={settings.FACE_LIVENESS_LIVE_INDEX}, "
-        f"threshold={settings.FACE_LIVENESS_THRESHOLD}"
-    )
-    result = liveness.assess(frame, [float(v) for v in bbox])
-    print(f"raw logits:        see 'face liveness diagnostic' log line above")
-    print(
-        f"predicted class:   (log line above; live_index="
-        f"{settings.FACE_LIVENESS_LIVE_INDEX} = Real)"
-    )
-    print(f"live probability:  {result.live_score:.4f}")
-    print(f"spoof probability: {result.spoof_score:.4f}")
-    print(f"threshold:         {result.threshold} (unchanged)")
-    print(f"status:            {result.status}")
-    print(f"passed:            {result.passed}")
-    print(f"reason:            {result.reason_code}")
-    debug_dir = Path(settings.MEDIA_ROOT) / "liveness_debug"
-    if settings.FACE_LIVENESS_DEBUG_SAVE_CROP:
-        saved = sorted(debug_dir.glob("liveness_crop_*.jpg"))
-        if saved:
-            print(f"saved crops:       {saved[-2:]}")
-    else:
-        print(
-            "saved crops:       set FACE_LIVENESS_DEBUG_SAVE_CROP=True to save "
-            "the exact classifier-input crop under media/liveness_debug/"
+    frame: np.ndarray,
+    out_dir: Path,
+    threshold: float,
+) -> dict | None:
+    """Run both pipelines on the production crop of one frame."""
+    faces = detector._detect_faces(frame)
+    if len(faces) != 1:
+        step(
+            f"[{label}] SCRFD found {len(faces)} faces — sample skipped "
+            "(diagnostic requires exactly one)."
         )
-    return 0 if result.status == "LIVE" else 2
+        return None
+    bbox = [float(v) for v in faces[0]["bbox"]]
+    crop = liveness._square_face_crop(frame, bbox)
+    if crop is None:
+        step(f"[{label}] face crop failed for bbox={bbox}")
+        return None
+    size = int(settings.FACE_LIVENESS_INPUT_SIZE)
+    resized = cv2.resize(crop, (size, size))
+
+    crop_path = out_dir / f"crop_{label}.jpg"
+    cv2.imwrite(str(crop_path), crop)
+    crop_hash = sha256_bytes(crop.tobytes())
+
+    # Production-crop equality proof: run the production assess() with the
+    # debug-crop flag enabled and byte-compare the persisted 80x80 model
+    # input with the diagnostic's own resized crop.
+    from biometrics.services.face_liveness import FaceLivenessEngine
+
+    debug_dir = Path(settings.MEDIA_ROOT) / "liveness_debug"
+    saved_before = set(debug_dir.glob("liveness_crop_*_80x80.jpg"))
+    old_flag = settings.FACE_LIVENESS_DEBUG_SAVE_CROP
+    try:
+        settings.FACE_LIVENESS_DEBUG_SAVE_CROP = True
+        production_result = liveness.assess(frame, bbox)
+    finally:
+        settings.FACE_LIVENESS_DEBUG_SAVE_CROP = old_flag
+    saved = sorted(set(debug_dir.glob("liveness_crop_*_80x80.jpg")) - saved_before)
+    diagnostic_input_file = debug_dir / f"diag_crop_{label}_80x80.jpg"
+    cv2.imwrite(str(diagnostic_input_file), resized)
+    # Byte-compare IDENTICALLY-ENCODED files (cv2.imwrite is deterministic for
+    # identical inputs on the same OpenCV build): production's persisted 80x80
+    # model input vs the diagnostic's own resize of the production crop.
+    production_input_hash = sha256_bytes(saved[-1].read_bytes()) if saved else "MISSING"
+    diagnostic_input_hash = sha256_bytes(diagnostic_input_file.read_bytes())
+    crop_equal = production_input_hash == diagnostic_input_hash
+
+    results = {}
+    for name, scalefactor, live_index, mapping in (
+        ("A(/255)", 1.0 / 255.0, 0, "[live, print, replay]"),
+        ("B(raw)", 1.0, 1, "[fake, Real, fake]"),
+    ):
+        blob = cv2.dnn.blobFromImage(
+            resized,
+            scalefactor=scalefactor,
+            size=(size, size),
+            mean=(0.0, 0.0, 0.0),
+            swapRB=False,
+        )
+        logits = forward_blob(liveness, blob)
+        probs = numpy_softmax(logits)
+        predicted = int(np.argmax(probs))
+        live_prob = float(probs[live_index])
+        spoof_prob = float(max(p for i, p in enumerate(probs) if i != live_index))
+        results[name] = {
+            "mapping": mapping,
+            "logits": [round(v, 4) for v in logits],
+            "softmax": [round(float(v), 4) for v in probs],
+            "predicted_class": predicted,
+            "live_index": live_index,
+            "live_prob": round(live_prob, 4),
+            "spoof_prob": round(spoof_prob, 4),
+            "decision": "LIVE" if live_prob >= threshold else "SPOOF",
+        }
+
+    production_input_hash_short = production_input_hash[:12]
+    print(
+        f"\n===== SAMPLE: {label} =====\n"
+        f"SCRFD score:        {float(faces[0]['score']):.4f}\n"
+        f"crop:               {crop_path.name} {crop.shape[1]}x{crop.shape[0]} "
+        f"sha256[:12]={crop_hash[:12]}\n"
+        f"crop equality:      production-input={production_input_hash_short} "
+        f"diagnostic-input={diagnostic_input_hash[:12]} "
+        f"-> {'IDENTICAL' if crop_equal else 'DIFFERENT (!!)'}\n"
+        f"production result:  {production_result.status} "
+        f"live={production_result.live_score:.4f} spoof={production_result.spoof_score:.4f}"
+    )
+    for name, data in results.items():
+        print(
+            f"TEST {name}: logits={data['logits']} softmax={data['softmax']} "
+            f"predicted={data['predicted_class']} live_prob={data['live_prob']} "
+            f"spoof_prob={data['spoof_prob']} decision={data['decision']} "
+            f"(mapping {data['mapping']})"
+        )
+    return {
+        "label": label,
+        "A": results["A(/255)"],
+        "B": results["B(raw)"],
+        "production": {
+            "status": production_result.status,
+            "live": round(production_result.live_score, 4),
+            "spoof": round(production_result.spoof_score, 4),
+        },
+        "crop_equal": crop_equal,
+    }
 
 
 def main() -> int:
-    from django.conf import settings
-
+    global THRESHOLD
     from biometrics.services.face_engine import get_face_engine
     from biometrics.services.face_liveness import get_face_liveness_engine
 
-    step("[1/6] loading engines")
+    THRESHOLD = float(settings.FACE_LIVENESS_THRESHOLD)
+    model_path = Path(settings.FACE_LIVENESS_MODEL_PATH)
+    if not model_path.exists():
+        return fail(f"liveness model missing: {model_path}")
+    model_hash = sha256_bytes(model_path.read_bytes())
+    step(f"model: {model_path.name}")
+    step(f"model sha256: {model_hash}")
+    step(f"expected     : {EXPECTED_MODEL_SHA256}")
+    step(f"hash match   : {'YES' if model_hash == EXPECTED_MODEL_SHA256 else 'NO (!!)'}")
+
     liveness = get_face_liveness_engine()
-    health = liveness.health()
-    if not health["ready"]:
-        return fail(f"MODEL UNAVAILABLE: {health['detail']}")
+    if not liveness.health()["ready"]:
+        return fail(f"liveness engine not ready: {liveness.health()['detail']}")
     detector = get_face_engine()
     if not detector.ready:
         return fail(f"SCRFD detector unavailable: {detector._load_error}")
 
-    still_path = sys.argv[1] if len(sys.argv) > 1 else None
-    if still_path is not None:
-        frame = cv2.imread(still_path)
-        if frame is None:
-            return fail(f"could not read still image: {still_path}")
+    args = [a for a in sys.argv[1:] if a != "--capture"]
+    capture_mode = "--capture" in sys.argv[1:]
+    out_dir = Path(settings.MEDIA_ROOT) / "tmp" / "ab_samples"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    samples: list[tuple[str, np.ndarray]] = []
+    if capture_mode:
+        count = int(args[0]) if args else 4
+        interval = float(args[1]) if len(args) > 1 else 12.0
+        labels = ["1_live_face", "2_phone_photo", "3_printed_photo", "4_replay_video"]
+        for index in range(count):
+            label = labels[index] if index < len(labels) else f"{index + 1}_sample"
+            step(f"capturing sample '{label}' in {interval:.0f}s ...")
+            time.sleep(interval)
+            frame = capture_one_frame()
+            if frame is None:
+                return 1
+            path = out_dir / f"frame_{label}.jpg"
+            cv2.imwrite(str(path), frame)
+            samples.append((label, frame))
+            step(f"captured -> {path}")
     else:
-        step("[2/6] capturing one real webcam frame")
-        frame = capture_one_frame()
-        if frame is None:
-            return 1
+        if not args:
+            step("capturing one live webcam frame ...")
+            frame = capture_one_frame()
+            if frame is None:
+                return 1
+            cv2.imwrite(str(out_dir / "frame_live.jpg"), frame)
+            samples.append(("live", frame))
+        for arg in args:
+            path = Path(arg)
+            frame = cv2.imread(str(path))
+            if frame is None:
+                return fail(f"could not read image: {path}")
+            samples.append((path.stem, frame))
 
-    step("[3/6] SCRFD on the frame (production path)")
-    faces = detector._detect_faces(frame)
-    scores = [round(float(f["score"]), 4) for f in faces]
-    boxes = [[round(float(v), 1) for v in f["bbox"]] for f in faces]
-    step(f"SCRFD: faces={len(faces)} scores={scores} bboxes={boxes}")
-    if len(faces) != 1:
-        return fail(
-            f"SCRFD found {len(faces)} face(s); the A/B test needs exactly 1."
+    records = []
+    for label, frame in samples:
+        record = evaluate_sample(liveness, detector, label, frame, out_dir, THRESHOLD)
+        if record:
+            records.append(record)
+
+    # ---- Separation summary: live-vs-spoof separation per pipeline --------
+    step("\n===== CONVENTION / SEPARATION SUMMARY (threshold=%.2f) =====" % THRESHOLD)
+    genuine = [r for r in records if "live" in r["label"].lower()]
+    attacks = [r for r in records if "live" not in r["label"].lower()]
+    for name in ("A", "B"):
+        live_probs = [r[name]["live_prob"] for r in records]
+        genuine_pass = sum(1 for r in genuine if r[name]["decision"] == "LIVE")
+        attack_blocked = sum(1 for r in attacks if r[name]["decision"] == "SPOOF")
+        margin = ""
+        if genuine and attacks:
+            min_live = min(r[name]["live_prob"] for r in genuine)
+            max_attack = max(r[name]["live_prob"] for r in attacks)
+            margin = f" | separation margin={max_attack - min_live:+.4f}"
+        step(
+            f"TEST {name}: genuine LIVE {genuine_pass}/{len(genuine)} | "
+            f"attacks blocked {attack_blocked}/{len(attacks)}{margin}"
         )
-    bbox = [float(v) for v in faces[0]["bbox"]]
-    detection_score = float(faces[0]["score"])
-
-    # ----------------------------------------------------------------------
-    # ONE crop for both tests: the engine's reference clamped crop, saved.
-    # ----------------------------------------------------------------------
-    crop = liveness._square_face_crop(frame, bbox)
-    if crop is None:
-        return fail(f"face crop failed for bbox={bbox}")
-    size = int(settings.FACE_LIVENESS_INPUT_SIZE)
-    tmp_dir = Path(settings.MEDIA_ROOT) / "tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    frame_path = tmp_dir / "ab_diag_frame.jpg"
-    crop_path = tmp_dir / "ab_face_crop.jpg"
-    resized_path = tmp_dir / "ab_face_crop_80x80.jpg"
-    cv2.imwrite(str(frame_path), frame)
-    cv2.imwrite(str(crop_path), crop)
-    resized = cv2.resize(crop, (size, size))
-    cv2.imwrite(str(resized_path), resized)
-    step(f"[3/6] frame+crop saved -> {frame_path.name}, {crop_path.name}, {resized_path.name}")
-
-    # ----------------------------------------------------------------------
-    # [4/6] TEST A vs TEST B on the SAME crop.
-    # ----------------------------------------------------------------------
-    step("[4/6] TEST A (production: /255) vs TEST B (upstream: raw 0-255)")
-    blob_a = cv2.dnn.blobFromImage(
-        resized,
-        scalefactor=1.0 / 255.0,
-        size=(size, size),
-        mean=(0.0, 0.0, 0.0),
-        swapRB=False,
+    step(
+        "\nDecision rule: select the convention supported by the reference "
+        "implementation AND the observed live-vs-spoof separation — never "
+        "merely the one that lets a genuine face pass."
     )
-    logits_a = forward_blob(liveness, blob_a)
-    report_test("TEST A  production preprocessing", blob_a, logits_a, "BGR /255, NCHW")
-
-    blob_b = cv2.dnn.blobFromImage(
-        resized,
-        scalefactor=1.0,
-        size=(size, size),
-        mean=(0.0, 0.0, 0.0),
-        swapRB=False,
-    )
-    logits_b = forward_blob(liveness, blob_b)
-    report_test("TEST B  upstream preprocessing", blob_b, logits_b, "BGR raw 0-255, NCHW")
-
-    # ----------------------------------------------------------------------
-    # [5/6] Upstream-replica pipeline (crop + preprocess in one shot).
-    # ----------------------------------------------------------------------
-    step("[5/6] upstream-replica crop+preprocess (int/int clamped crop, no /255)")
-    blob_c, used_scale_c = upstream_crop(frame, bbox, float(settings.FACE_LIVENESS_CROP_SCALE), size)
-    logits_c = forward_blob(liveness, blob_c)
-    report_test("TEST C  full upstream replica", blob_c, logits_c, "BGR raw 0-255, NCHW, int crop")
-
-    # ----------------------------------------------------------------------
-    # Class-order report: NO mapping chosen, NO result forced.
-    # ----------------------------------------------------------------------
-    step("[6/6] class-order interpretation report (no decision made here)")
-    probs_a = numpy_softmax(logits_a)
-    probs_b = numpy_softmax(logits_b)
-    print("\n===== CLASS-ORDER DIAGNOSTIC (report only) =====")
-    print(f"configured FACE_LIVENESS_LIVE_INDEX: {settings.FACE_LIVENESS_LIVE_INDEX}")
-    for name, probs in (("TEST A (/255)", probs_a), ("TEST B (raw 0-255)", probs_b)):
-        argmax = int(np.argmax(probs))
-        print(f"\n{name}: softmax={[round(float(v), 4) for v in probs]} argmax={argmax}")
-        print(
-            f"  interpretation A) [live, print, replay]: "
-            f"live_prob={probs[0]:.4f} -> "
-            f"{'LIVE' if probs[0] >= float(settings.FACE_LIVENESS_THRESHOLD) else 'SPOOF'}"
-        )
-        print(
-            f"  interpretation B) class 1 = Real convention: "
-            f"real_prob(class1)={probs[1]:.4f} -> "
-            f"{'LIVE' if probs[1] >= float(settings.FACE_LIVENESS_THRESHOLD) else 'SPOOF'}"
-        )
-    print(
-        "\nNOTE: which interpretation is correct can only be settled by "
-        "calibration evidence (e.g. score a known photo-of-a-print attack "
-        "and a known live face through BOTH preprocessing variants and see "
-        "which class lights up), not by preferring a reference."
-    )
-
-    # ----------------------------------------------------------------------
-    # Crop-pipeline comparison against the upstream reference.
-    # ----------------------------------------------------------------------
-    box_w, box_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    engine_scale = min(
-        (frame.shape[0] - 1) / box_h,
-        (frame.shape[1] - 1) / box_w,
-        float(settings.FACE_LIVENESS_CROP_SCALE),
-    )
-    print("\n===== CROP PIPELINE COMPARISON (ours vs upstream) =====")
-    print(f"bbox (x1,y1,x2,y2):   [{bbox[0]:.1f}, {bbox[1]:.1f}, {bbox[2]:.1f}, {bbox[3]:.1f}]")
-    print(f"bbox conversion:      ours xyxy->xywh(float) | upstream int(x1),int(y1),int(x2-x1),int(y2-y1)")
-    print(f"scale formula:        identical: min((H-1)/box_h, (W-1)/box_w, 2.7)")
-    print(
-        f"effective scale:      ours (float bbox)={engine_scale:.4f} | "
-        f"upstream (int bbox)={used_scale_c:.4f}"
-    )
-    print(f"crop bounds:          both centred on face, clamped to image, no padding")
-    print(f"crop dimensions:      {crop.shape[1]}x{crop.shape[0]} (ours) | int-bbox replica differs only by <=1px rounding")
-    print(f"resize:               both cv2.resize direct to {size}x{size}")
-    print("colour order:         both BGR (swapRB=False here; upstream keeps BGR too)")
-    print(
-        "normalization:        DIFFERENT - ours /255 (0..1), upstream raw 0..255 "
-        "(blobFromImage scalefactor 1.0)"
-    )
-    print(f"tensor layout:        both NCHW float32 {blob_a.shape[2:]}")
-    print(f"SCRFD score:          {detection_score:.4f}")
-
-    exit_code = production_verification(liveness, frame, bbox)
-    return exit_code
+    if records and not all(r["crop_equal"] for r in records):
+        step("WARNING: production vs diagnostic crop mismatch detected!")
+    return 0
 
 
 if __name__ == "__main__":

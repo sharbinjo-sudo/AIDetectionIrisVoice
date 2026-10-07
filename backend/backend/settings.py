@@ -298,6 +298,24 @@ FACE_LIVENESS_THRESHOLD = _env_float("FACE_LIVENESS_THRESHOLD", 0.60)
 # regardless of this flag, and liveness is never reported as passed unless the
 # dedicated model actually ran and returned a live score.
 FACE_LIVENESS_REQUIRED = _env_bool("FACE_LIVENESS_REQUIRED", not DEBUG)
+# Temporal challenge liveness: a single-frame PAD verdict is supporting
+# evidence, never proof of liveness (the A/B diagnostic shows the deployed
+# MiniFASNetV2 checkpoint can be defeated by a determined photo attack).
+# Registration/login therefore additionally require a randomized action
+# (blink / head turn) verified over multiple consecutive webcam frames.
+# Raw frames exist only in memory during per-frame feature extraction and
+# are released immediately afterwards; nothing is stored.
+FACE_CHALLENGE_SESSION_TTL = int(_env("FACE_CHALLENGE_SESSION_TTL", "180"))
+FACE_CHALLENGE_TOKEN_MAX_AGE = int(_env("FACE_CHALLENGE_TOKEN_MAX_AGE", "600"))
+FACE_CHALLENGE_MIN_FRAMES = int(_env("FACE_CHALLENGE_MIN_FRAMES", "6"))
+FACE_CHALLENGE_MAX_FRAMES = int(_env("FACE_CHALLENGE_MAX_FRAMES", "30"))
+FACE_CHALLENGE_MOTION_THRESHOLD = _env_float("FACE_CHALLENGE_MOTION_THRESHOLD", 2.0)
+FACE_CHALLENGE_MOTION_FRAMES = int(_env("FACE_CHALLENGE_MOTION_FRAMES", "2"))
+FACE_CHALLENGE_OPEN_THRESHOLD = _env_float("FACE_CHALLENGE_OPEN_THRESHOLD", 0.16)
+FACE_CHALLENGE_CLOSED_THRESHOLD = _env_float("FACE_CHALLENGE_CLOSED_THRESHOLD", 0.09)
+FACE_CHALLENGE_CLOSED_FRAMES = int(_env("FACE_CHALLENGE_CLOSED_FRAMES", "2"))
+FACE_CHALLENGE_TURN_THRESHOLD = _env_float("FACE_CHALLENGE_TURN_THRESHOLD", 0.18)
+FACE_CHALLENGE_TURN_FRAMES = int(_env("FACE_CHALLENGE_TURN_FRAMES", "2"))
 VOICE_MIN_SECONDS = _env_float("VOICE_MIN_SECONDS", 2.0)
 VOICE_MAX_SECONDS = _env_float("VOICE_MAX_SECONDS", 15.0)
 VOICE_QUALITY_THRESHOLD = _env_float("VOICE_QUALITY_THRESHOLD", 0.55)

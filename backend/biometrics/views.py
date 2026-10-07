@@ -23,10 +23,12 @@ from .serializers import (
     EnrollmentStatusSerializer,
     IrisTrackingRequestSerializer,
     IrisTestRequestSerializer,
+    LivenessChallengeVerifyRequestSerializer,
     UserDetailSerializer,
     UserSerializer,
     VoiceTestRequestSerializer,
 )
+from .services.challenge_liveness import create_challenge, verify_challenge_frames
 from .services.exceptions import BiometricProcessingError, BiometricServiceError
 from .services.workflow import (
     authenticate_enrolled_user,
@@ -328,6 +330,59 @@ class VoiceTestView(APIView):
         return success_response(result)
 
 
+class LivenessChallengeView(APIView):
+    """Issue a randomized temporal-liveness challenge (blink / head turn)."""
+
+    def post(self, request):
+        return success_response(create_challenge())
+
+
+class LivenessChallengeVerifyView(APIView):
+    """Verify a liveness challenge over a sequence of webcam frames.
+
+    Raw frames are decoded in memory only, used for per-frame feature
+    extraction, and released immediately — no video and no raw frames are
+    stored anywhere (on disk, in the database, or in the cache).
+    """
+
+    parser_classes = (MultiPartParser, FormParser)
+
+    def post(self, request):
+        serializer = LivenessChallengeVerifyRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        import cv2
+        import numpy as np
+
+        decoded = []
+        try:
+            for upload in serializer.validated_data["frames"]:
+                data = upload.read()
+                array = cv2.imdecode(
+                    np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR
+                )
+                if array is None:
+                    return error_response(
+                        "A liveness challenge frame could not be decoded.",
+                        422,
+                        code="LIVENESS_CHALLENGE_FAILED",
+                        reason="FRAME_UNDECODABLE",
+                    )
+                decoded.append(array)
+            result = verify_challenge_frames(
+                serializer.validated_data["challenge_id"], decoded
+            )
+        finally:
+            decoded.clear()  # release raw frames immediately after use
+        if not result.get("verified"):
+            return error_response(
+                result.get("message", "The liveness challenge failed."),
+                422,
+                code="LIVENESS_CHALLENGE_FAILED",
+                reason=result.get("reason"),
+            )
+        return success_response(result)
+
+
 class BiometricEnrollmentView(APIView):
     parser_classes = (MultiPartParser, FormParser)
 
@@ -352,6 +407,7 @@ class BiometricEnrollmentView(APIView):
                             iris_paths=iris_paths,
                             voice_paths=voice_paths,
                             eye_side=data["eye_side"],
+                            liveness_challenge=data.get("liveness_challenge"),
                         )
         except BiometricServiceError as exc:
             return error_response(str(exc), exc.status_code)
@@ -385,6 +441,7 @@ class BiometricAuthenticateView(APIView):
                             iris_paths=iris_paths,
                             voice_path=voice_path,
                             eye_side=user.enrolled_eye_side,
+                            liveness_challenge=data.get("liveness_challenge"),
                         )
         except BiometricServiceError as exc:
             return error_response(str(exc), exc.status_code)

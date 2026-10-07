@@ -14,6 +14,7 @@ from biometrics.models import Decision
 from .engines import get_iris_engine, get_voice_engine
 from .face_engine import get_face_engine
 from .face_liveness import not_evaluated_result, summarize_liveness
+from .challenge_liveness import consume_verified_challenge
 from .exceptions import (
     BiometricServiceError,
     BiometricValidationError,
@@ -212,6 +213,19 @@ def evaluate_iris_test(
     return result
 
 
+def _require_liveness_challenge(liveness_challenge: str | None) -> str:
+    """Gate enrollment/login on a verified temporal liveness challenge.
+
+    A single-frame PAD verdict is evidence, never proof of liveness, so when
+    the dedicated liveness gate is required (production), the caller must
+    present a signed single-use token from a verified randomized-action
+    challenge. Development (FACE_LIVENESS_REQUIRED=False) may omit it.
+    """
+    if not liveness_challenge and not settings.FACE_LIVENESS_REQUIRED:
+        return ""
+    return consume_verified_challenge(liveness_challenge)
+
+
 def enroll_user_biometrics(
     *,
     user: BiometricUser,
@@ -219,12 +233,14 @@ def enroll_user_biometrics(
     iris_paths: list[str],
     voice_paths: list[str],
     eye_side: str,
+    liveness_challenge: str | None = None,
 ) -> dict:
     """Create encrypted face/voice templates and retain iris captures.
 
     In ``FACE_PRIMARY_CAPTURE_MODE`` iris files are transport-compatible
     captures only; no iris identity template is fabricated.
     """
+    _require_liveness_challenge(liveness_challenge)
     face_engine = get_face_engine()
     face_samples = [face_engine.extract_features(path) for path in face_paths]
     # Registration requires a dedicated liveness result for every captured
@@ -415,11 +431,13 @@ def authenticate_enrolled_user(
     iris_paths: list[str],
     voice_path: str,
     eye_side: str,
+    liveness_challenge: str | None = None,
 ) -> dict:
     """Temporally compare enrolled modalities using the active capture policy."""
     started = perf_counter()
     if not user.is_enrolled:
         raise EnrollmentIncompleteError("Three-modal enrollment is incomplete.")
+    _require_liveness_challenge(liveness_challenge)
 
     face_reference = decrypt_template(user.face_template_encrypted)["vector"]
     iris_reference = (

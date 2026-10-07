@@ -26,6 +26,7 @@ from .services.engines import IrisBiometricEngine, VoiceBiometricEngine
 from .services.engines import IrisSample, VoiceSample
 from .services.exceptions import (
     BiometricProcessingError,
+    BiometricValidationError,
     ModelUnavailableError,
     SpoofDetectedError,
 )
@@ -1260,6 +1261,7 @@ class FaceLivenessWorkflowTests(TestCase):
                 iris_paths=["camera_1.jpg"],
                 voice_paths=["voice_1.wav"],
                 eye_side="LEFT",
+                liveness_challenge=_verified_challenge_token(),
             )
         self.user.refresh_from_db()
         self.assertFalse(self.user.face_template_encrypted)
@@ -1396,6 +1398,7 @@ class FaceLivenessWorkflowTests(TestCase):
             iris_paths=["camera_frame.jpg"],
             voice_path="login_voice.wav",
             eye_side="LEFT",
+            liveness_challenge=_verified_challenge_token(),
         )
 
         self.assertEqual(result["decision"], Decision.PROCESSING_ERROR)
@@ -2135,3 +2138,451 @@ class BiometricAuthenticateApiTests(TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("too large", response.json()["message"])
+
+
+def _create_challenge_with_action(action: str) -> dict:
+    """Create a challenge session with a deterministic action for tests.
+
+    Only the random ACTION is pinned; the challenge id stays random so
+    cache keys never collide between tests.
+    """
+    from biometrics.services import challenge_liveness as cl
+
+    with patch(
+        "biometrics.services.challenge_liveness.secrets.choice",
+        return_value=action,
+    ):
+        return cl.create_challenge()
+
+
+def _blink_signals():
+    from biometrics.services.challenge_liveness import FrameSignal
+
+    return [
+        FrameSignal(0.30, 0.0, 0.0),
+        FrameSignal(0.31, 0.0, 6.0),
+        FrameSignal(0.05, 0.0, 7.0),
+        FrameSignal(0.04, 0.0, 6.0),
+        FrameSignal(0.28, 0.0, 7.0),
+        FrameSignal(0.29, 0.0, 6.0),
+    ]
+
+
+def _turn_signals(direction: float) -> list:
+    from biometrics.services.challenge_liveness import FrameSignal
+
+    return [
+        FrameSignal(0.30, 0.0, 0.0),
+        FrameSignal(0.30, 0.05 * direction, 6.0),
+        FrameSignal(0.30, 0.30 * direction, 6.0),
+        FrameSignal(0.30, 0.32 * direction, 6.0),
+        FrameSignal(0.30, 0.28 * direction, 6.0),
+        FrameSignal(0.30, 0.10, 6.0),
+    ]
+
+
+def _static_signals(count: int = 8) -> list:
+    """A repeated still image: no inter-frame motion at all."""
+    from biometrics.services.challenge_liveness import FrameSignal
+
+    return [FrameSignal(0.30, 0.0, 0.0)] * count
+
+
+def _verified_challenge_token(action: str = "BLINK") -> str:
+    """Create + verify a challenge with synthetic signals; return the token."""
+    from biometrics.services import challenge_liveness as cl
+
+    challenge = _create_challenge_with_action(action)
+    if action == "BLINK":
+        signals = _blink_signals()
+    elif action == "TURN_LEFT":
+        signals = _turn_signals(+1.0)
+    else:
+        signals = _turn_signals(-1.0)
+    with patch(
+        "biometrics.services.challenge_liveness.extract_signals",
+        return_value=signals,
+    ):
+        result = cl.verify_challenge_frames(
+            challenge["challenge_id"], [object()] * 6
+        )
+    assert result["verified"], result
+    return result["challenge_token"]
+
+
+class _FakeLandmark:
+    def __init__(self, x: float, y: float):
+        self.x = x
+        self.y = y
+
+
+def _fake_landmarks(
+    *, upper_y: float = 0.5, lower_y: float = 0.55, nose_x: float = 0.35
+) -> list:
+    landmarks = [_FakeLandmark(0.0, 0.0) for _ in range(478)]
+    landmarks[33] = _FakeLandmark(0.2, 0.5)  # left eye outer
+    landmarks[133] = _FakeLandmark(0.3, 0.5)  # left eye inner
+    landmarks[159] = _FakeLandmark(0.25, upper_y)  # left upper lid
+    landmarks[145] = _FakeLandmark(0.25, lower_y)  # left lower lid
+    landmarks[263] = _FakeLandmark(0.4, 0.5)  # right eye outer
+    landmarks[362] = _FakeLandmark(0.5, 0.5)  # right eye inner
+    landmarks[386] = _FakeLandmark(0.45, upper_y)  # right upper lid
+    landmarks[374] = _FakeLandmark(0.45, lower_y)  # right lower lid
+    landmarks[1] = _FakeLandmark(nose_x, 0.7)  # nose tip
+    return landmarks
+
+
+class ChallengeLivenessServiceTests(TestCase):
+    """Randomized action verification over consecutive frames."""
+
+    def setUp(self):
+        cache.clear()
+
+    def test_challenge_creation_uses_a_random_action(self):
+        from biometrics.services.challenge_liveness import ACTIONS, create_challenge
+
+        actions = {create_challenge()["action"] for _ in range(30)}
+        self.assertTrue(actions.issubset(set(ACTIONS)))
+
+    def test_real_blink_sequence_passes(self):
+        from biometrics.services.challenge_liveness import (
+            evaluate_action,
+        )
+
+        verdict = evaluate_action("BLINK", _blink_signals())
+        self.assertTrue(verdict["verified"])
+        self.assertEqual(verdict["action"], "BLINK")
+
+    def test_head_turn_sequences_pass(self):
+        from biometrics.services.challenge_liveness import evaluate_action
+
+        self.assertTrue(evaluate_action("TURN_LEFT", _turn_signals(+1.0))["verified"])
+        self.assertTrue(evaluate_action("TURN_RIGHT", _turn_signals(-1.0))["verified"])
+
+    def test_static_repeated_still_image_is_rejected(self):
+        """A photo/print/screen replay of a STILL image cannot pass."""
+        from biometrics.services.challenge_liveness import evaluate_action
+
+        verdict = evaluate_action("BLINK", _static_signals())
+        self.assertFalse(verdict["verified"])
+        self.assertEqual(verdict["reason"], "STATIC_SEQUENCE")
+
+    def test_wrong_action_is_rejected(self):
+        """Performing a different action than requested must fail."""
+        from biometrics.services.challenge_liveness import evaluate_action
+
+        verdict = evaluate_action("BLINK", _turn_signals(+1.0))
+        self.assertFalse(verdict["verified"])
+        self.assertEqual(verdict["reason"], "BLINK_NOT_DETECTED")
+
+    def test_too_few_frames_are_rejected(self):
+        from biometrics.services.challenge_liveness import evaluate_action
+
+        verdict = evaluate_action("BLINK", _blink_signals()[:4])
+        self.assertFalse(verdict["verified"])
+        self.assertEqual(verdict["reason"], "INSUFFICIENT_FRAMES")
+
+    def test_landmark_signal_math(self):
+        from biometrics.services.challenge_liveness import signals_from_landmarks
+
+        open_face = signals_from_landmarks(_fake_landmarks(), motion=5.0)
+        self.assertAlmostEqual(open_face.eye_openness, 0.5, places=5)
+        self.assertAlmostEqual(open_face.yaw, 0.0, places=5)
+        self.assertEqual(open_face.motion, 5.0)
+
+        turned = signals_from_landmarks(
+            _fake_landmarks(nose_x=0.45), motion=5.0
+        )
+        self.assertAlmostEqual(turned.yaw, 0.5, places=5)
+
+        closed = signals_from_landmarks(
+            _fake_landmarks(upper_y=0.53, lower_y=0.53), motion=5.0
+        )
+        self.assertAlmostEqual(closed.eye_openness, 0.0, places=5)
+
+    def test_verify_marks_session_and_returns_single_use_token(self):
+        from biometrics.services.challenge_liveness import (
+            consume_verified_challenge,
+            verify_challenge_frames,
+        )
+
+        challenge = _create_challenge_with_action("BLINK")
+        with patch(
+            "biometrics.services.challenge_liveness.extract_signals",
+            return_value=_blink_signals(),
+        ):
+            result = verify_challenge_frames(
+                challenge["challenge_id"], [object()] * 6
+            )
+        self.assertTrue(result["verified"])
+        self.assertEqual(consume_verified_challenge(result["challenge_token"]), "BLINK")
+        with self.assertRaises(BiometricValidationError):
+            consume_verified_challenge(result["challenge_token"])
+
+    def test_unverified_challenge_cannot_be_consumed(self):
+        from biometrics.services.challenge_liveness import (
+            consume_verified_challenge,
+            create_challenge,
+            signing,
+        )
+
+        challenge = create_challenge()
+        token = signing.dumps(
+            {"cid": challenge["challenge_id"], "act": challenge["action"]},
+            salt="liveness-challenge",
+        )
+        with self.assertRaises(BiometricValidationError):
+            consume_verified_challenge(token)
+
+    def test_missing_or_garbage_tokens_are_rejected(self):
+        from biometrics.services.challenge_liveness import (
+            consume_verified_challenge,
+        )
+
+        with self.assertRaises(BiometricValidationError):
+            consume_verified_challenge(None)
+        with self.assertRaises(BiometricValidationError):
+            consume_verified_challenge("not-a-token")
+
+
+def _challenge_frame_jpegs(count: int) -> list:
+    """Build `count` real (tiny) JPEG uploads for the verify endpoint."""
+    import cv2
+    import numpy as np
+
+    frame = np.zeros((48, 48, 3), dtype=np.uint8)
+    ok, encoded = cv2.imencode(".jpg", frame)
+    assert ok
+    return [
+        SimpleUploadedFile(f"f{i}.jpg", encoded.tobytes(), content_type="image/jpeg")
+        for i in range(count)
+    ]
+
+
+class ChallengeLivenessApiTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+
+    def test_challenge_endpoint_creates_session(self):
+        response = self.client.post("/api/v1/liveness/challenge/")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["data"]
+        self.assertIn(data["action"], ("BLINK", "TURN_LEFT", "TURN_RIGHT"))
+        self.assertIn("instructions", data)
+        self.assertIn("challenge_id", data)
+
+    def test_verify_endpoint_returns_token_for_a_live_sequence(self):
+        from biometrics.services import challenge_liveness as cl
+
+        challenge = _create_challenge_with_action("BLINK")
+        frames = _challenge_frame_jpegs(6)
+        with patch(
+            "biometrics.services.challenge_liveness.extract_signals",
+            return_value=_blink_signals(),
+        ):
+            response = self.client.post(
+                "/api/v1/liveness/challenge/verify/",
+                data={"challenge_id": challenge["challenge_id"], "frames": frames},
+                format="multipart",
+            )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["data"]
+        self.assertTrue(data["verified"])
+        self.assertIn("challenge_token", data)
+        # The token must be consumable exactly once by the workflow.
+        from biometrics.services.challenge_liveness import consume_verified_challenge
+
+        self.assertEqual(consume_verified_challenge(data["challenge_token"]), "BLINK")
+
+    def test_verify_endpoint_rejects_static_replay_with_422(self):
+        challenge = _create_challenge_with_action("BLINK")
+        frames = _challenge_frame_jpegs(6)
+        with patch(
+            "biometrics.services.challenge_liveness.extract_signals",
+            return_value=_static_signals(),
+        ):
+            response = self.client.post(
+                "/api/v1/liveness/challenge/verify/",
+                data={"challenge_id": challenge["challenge_id"], "frames": frames},
+                format="multipart",
+            )
+        self.assertEqual(response.status_code, 422)
+        payload = response.json()
+        self.assertEqual(payload["error"], "LIVENESS_CHALLENGE_FAILED")
+        self.assertEqual(payload["reason"], "STATIC_SEQUENCE")
+
+    def test_verify_endpoint_requires_minimum_frame_count(self):
+        challenge = _create_challenge_with_action("BLINK")
+        frames = _challenge_frame_jpegs(3)
+        response = self.client.post(
+            "/api/v1/liveness/challenge/verify/",
+            data={"challenge_id": challenge["challenge_id"], "frames": frames},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 400)
+
+
+class ChallengeLivenessWorkflowTests(TestCase):
+    """Enrollment/login are blocked until the challenge is verified."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = BiometricUser.objects.create(
+            external_id="CHALLENGE-001",
+            full_name="Challenge User",
+        )
+
+    def _enroll_prototype(self):
+        self.user.enrollment_status = EnrollmentStatus.COMPLETE
+        self.user.face_template_encrypted = "encrypted-face"
+        self.user.iris_template_encrypted = ""
+        self.user.voice_template_encrypted = "encrypted-voice"
+        self.user.save()
+
+    @override_settings(FACE_LIVENESS_REQUIRED=True)
+    def test_enrollment_is_blocked_without_a_verified_challenge(self):
+        with self.assertRaises(BiometricValidationError):
+            enroll_user_biometrics(
+                user=self.user,
+                face_paths=["camera_1.jpg"],
+                iris_paths=["camera_1.jpg"],
+                voice_paths=["voice_1.wav"],
+                eye_side="LEFT",
+            )
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.face_template_encrypted)
+
+    @override_settings(FACE_PRIMARY_CAPTURE_MODE=True, FACE_LIVENESS_REQUIRED=True)
+    def test_login_is_blocked_without_a_verified_challenge(self):
+        self._enroll_prototype()
+        with self.assertRaises(BiometricValidationError):
+            authenticate_enrolled_user(
+                user=self.user,
+                face_paths=["camera_frame.jpg"],
+                iris_paths=["camera_frame.jpg"],
+                voice_path="login_voice.wav",
+                eye_side="LEFT",
+            )
+
+    @override_settings(FACE_LIVENESS_REQUIRED=True)
+    def test_garbage_token_is_rejected(self):
+        with self.assertRaises(BiometricValidationError):
+            enroll_user_biometrics(
+                user=self.user,
+                face_paths=["camera_1.jpg"],
+                iris_paths=["camera_1.jpg"],
+                voice_paths=["voice_1.wav"],
+                eye_side="LEFT",
+                liveness_challenge="forged-token",
+            )
+
+    @override_settings(
+        FACE_PRIMARY_CAPTURE_MODE=True,
+        FACE_LIVENESS_REQUIRED=True,
+        MIN_FACE_SAMPLES=1,
+        MIN_VOICE_SAMPLES=1,
+    )
+    @patch("biometrics.services.workflow.get_face_engine")
+    @patch("biometrics.services.workflow.get_voice_engine")
+    @patch("biometrics.services.workflow.get_iris_engine")
+    def test_verified_challenge_allows_enrollment_exactly_once(
+        self, iris_engine, voice_engine, face_engine
+    ):
+        face_engine.return_value.extract_features.return_value = FaceSample(
+            [0.2, 0.4, 0.6], 0.88, 0.95, 1, True, "FACE_VALID", "ok",
+            liveness=_live_result(),
+        )
+        face_engine.return_value.aggregate.return_value = [0.2, 0.4, 0.6]
+        voice_engine.return_value.extract_features.return_value = VoiceSample(
+            duration_seconds=4.0,
+            quality_score=0.86,
+            speech_activity_score=0.78,
+            rms_level=0.1,
+            peak_level=0.4,
+            embedding=[0.4, 0.5, 0.6],
+            segment_count=2,
+        )
+        voice_engine.return_value.aggregate_samples.return_value = [0.4, 0.5, 0.6]
+
+        token = _verified_challenge_token("BLINK")
+        result = enroll_user_biometrics(
+            user=self.user,
+            face_paths=["camera_1.jpg"],
+            iris_paths=["camera_1.jpg"],
+            voice_paths=["voice_1.wav"],
+            eye_side="LEFT",
+            liveness_challenge=token,
+        )
+        self.assertEqual(result["enrollment_status"], EnrollmentStatus.COMPLETE)
+
+        # The token is single use: a second enrollment attempt fails closed.
+        with self.assertRaises(BiometricValidationError):
+            enroll_user_biometrics(
+                user=self.user,
+                face_paths=["camera_1.jpg"],
+                iris_paths=["camera_1.jpg"],
+                voice_paths=["voice_1.wav"],
+                eye_side="LEFT",
+                liveness_challenge=token,
+            )
+
+    @override_settings(
+        FACE_PRIMARY_CAPTURE_MODE=True,
+        DEVELOPMENT_THRESHOLDS=True,
+        FACE_LIVENESS_REQUIRED=False,
+    )
+    @patch("biometrics.services.workflow.get_calibrated_thresholds")
+    @patch("biometrics.services.workflow.decrypt_template")
+    @patch("biometrics.services.workflow.get_face_engine")
+    @patch("biometrics.services.workflow.get_voice_engine")
+    @patch("biometrics.services.workflow.get_iris_engine")
+    def test_development_without_requirement_does_not_need_a_challenge(
+        self, iris_engine, voice_engine, face_engine, decrypt, calibrated
+    ):
+        self._enroll_prototype()
+        decrypt.side_effect = [
+            {"vector": [0.2, 0.4, 0.6]},
+            {"vector": [0.4, 0.5, 0.6]},
+        ]
+        calibrated.return_value = {
+            "fusion_threshold": 0.80,
+            "single_modality_fallback_threshold": 0.9,
+            "source": "test",
+            "calibrated": False,
+        }
+        face_engine.return_value.extract_features.return_value = FaceSample(
+            [0.2, 0.4, 0.6], 0.9, 0.95, 1, True, "FACE_VALID", "ok"
+        )
+        face_engine.return_value.compare_samples.return_value = {
+            "face": {
+                "quality_score": 0.9,
+                "detection_confidence": 0.95,
+                "normalized_score": 0.95,
+                "raw_score": 0.9,
+                "valid_measurement": True,
+                "passed": True,
+                "sample_count": 1,
+            }
+        }
+        voice_engine.return_value.compare.return_value = {
+            "voice": {
+                "quality_score": 0.9,
+                "speech_activity_score": 0.85,
+                "segment_count": settings.MIN_VOICE_SEGMENTS,
+                "normalized_score": 0.9,
+                "raw_score": 0.8,
+                "passed": True,
+            }
+        }
+        with patch(
+            "biometrics.services.workflow.consume_verified_challenge"
+        ) as consume:
+            authenticate_enrolled_user(
+                user=self.user,
+                face_paths=["camera_frame.jpg"],
+                iris_paths=["camera_frame.jpg"],
+                voice_path="login_voice.wav",
+                eye_side="LEFT",
+            )
+        consume.assert_not_called()

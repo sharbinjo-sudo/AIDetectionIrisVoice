@@ -351,6 +351,20 @@ class FaceLivenessEngine:
         # softmax [0.0004, 0.0061, 0.9935] (argmax 2), while raw 0-255
         # produced [0.0071, 0.9799, 0.0131] (argmax 1), and the byte-exact
         # upstream-replica pipeline agreed ([0.0112, 0.9413, 0.0475]).
+        #
+        # Four-physical-sample check (diag_liveness.py, media/tmp/ab_samples:
+        # live face, phone photo, printed photo, replay video), threshold 0.60:
+        # /255 + [live, print, replay] put the GENUINE face on class 2
+        # (softmax [0.0003, 0.0057, 0.9940], live_prob 0.0003 -> SPOOF), the
+        # SAME class every attack lands on (live_prob 0.0002-0.0003), i.e. zero
+        # live/spoof separation (margin +0.0000). Raw 0-255 + class 1 = Real
+        # gives genuine live_prob 0.9731 (softmax [0.0001, 0.9731, 0.0268])
+        # vs attacks <= 0.0117 (phone photo 0.0117, print 0.0006, replay
+        # 0.0000): margin 0.9614. Both reject all 3 attacks, but only this
+        # convention separates genuine from spoof. A single-frame PAD result
+        # is still NOT treated as guaranteed liveness; challenge-based
+        # temporal verification (services/challenge_liveness.py) gates
+        # enrollment and login on top of it.
         # OpenCV images are already BGR, so swapRB must stay False; NCHW
         # comes from blobFromImage.
         blob = self._cv2.dnn.blobFromImage(
